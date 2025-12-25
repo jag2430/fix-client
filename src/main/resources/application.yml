@@ -1,0 +1,10 @@
+server:
+  port: 8081
+
+fix:
+  config-file: quickfix-client.cfg
+
+logging:
+  level:
+    quickfix: INFO
+    com.example: DEBUG
