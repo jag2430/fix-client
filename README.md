@@ -25,16 +25,16 @@ A Spring Boot application that provides a REST API interface to send FIX orders 
          │                       │                       │
          ▼                       ▼                       ▼
 ┌────────────────────────────────────────────────────────────────┐
-│                     FIX Client Application                      │
+│                     FIX Client Application                     │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
-│  │ OrderService │  │PositionSvc  │  │ MarketDataService    │  │
+│  │ OrderService │  │PositionSvc   │  │ MarketDataService    │  │
 │  │              │  │              │  │ (Alpaca/NoOp)        │  │
 │  └──────┬───────┘  └──────┬───────┘  └──────────┬───────────┘  │
-│         │                 │                      │              │
-│         ▼                 ▼                      ▼              │
+│         │                 │                     │              │
+│         ▼                 ▼                     ▼              │
 │  ┌─────────────────────────────────────────────────────────┐   │
-│  │              Redis (Cache + Pub/Sub)                     │   │
-│  │  • positions:updates  • executions:updates  • orders:*   │   │
+│  │              Redis (Cache + Pub/Sub)                    │   │
+│  │  • positions:updates  • executions:updates  • orders:*  │   │
 │  └─────────────────────────────────────────────────────────┘   │
 └────────────────────────────────────────────────────────────────┘
          │
