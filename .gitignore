@@ -46,3 +46,6 @@ buildNumber.properties
 # OS
 .DS_Store
 Thumbs.db
+
+# Docker
+postgres_data/
