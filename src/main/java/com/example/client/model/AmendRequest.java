@@ -12,9 +12,9 @@ import java.math.BigDecimal;
 @NoArgsConstructor
 @AllArgsConstructor
 public class AmendRequest {
-  private String originalClOrdId;
-  private String symbol;
-  private String side;        // BUY or SELL
-  private Integer newQuantity; // Optional - null to keep existing
-  private BigDecimal newPrice; // Optional - null to keep existing
+    private String originalClOrdId;
+    private String symbol;
+    private String side;           // BUY or SELL
+    private Integer newQuantity;   // Optional - null to keep existing
+    private BigDecimal newPrice;   // Optional - null to keep existing
 }

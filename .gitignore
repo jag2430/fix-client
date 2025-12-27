@@ -47,5 +47,6 @@ buildNumber.properties
 .DS_Store
 Thumbs.db
 
-# Docker
-postgres_data/
+# FIX data and logs
+target/data/
+target/logs/

@@ -5,6 +5,7 @@ fix:
   config-file: quickfix-client.cfg
 
 spring:
+  # PostgreSQL Configuration
   datasource:
     url: jdbc:postgresql://localhost:5432/fixclient
     username: fixuser
@@ -30,15 +31,49 @@ spring:
         order_inserts: true
         order_updates: true
 
+  # Redis Configuration
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 2000ms
+      lettuce:
+        pool:
+          max-active: 8
+          max-idle: 8
+          min-idle: 2
+          max-wait: -1ms
+
+# Redis pub/sub channels
+redis:
+  channels:
+    positions: positions:updates
+    executions: executions:updates
+    orders: orders:updates
+  cache:
+    positions-ttl: 3600
+    orders-ttl: 86400
+
+# Market Data Configuration (for future Alpaca integration)
+market-data:
+  provider: ${MARKET_DATA_PROVIDER:none}
+  alpaca:
+    api-key: ${ALPACA_API_KEY:}
+    api-secret: ${ALPACA_API_SECRET:}
+    base-url: ${ALPACA_BASE_URL:https://paper-api.alpaca.markets}
+    data-url: ${ALPACA_DATA_URL:wss://stream.data.alpaca.markets/v2}
+    feed: iex
+
 logging:
   level:
     quickfix: INFO
     com.example: DEBUG
+    org.springframework.data.redis: DEBUG
     org.hibernate.SQL: DEBUG
-    org.hibernate.type.descriptor.sql.BasicBinder: TRACE
 
 ---
-# Profile for development with detailed logging
+# Development profile
 spring:
   config:
     activate:
@@ -46,12 +81,8 @@ spring:
   jpa:
     show-sql: true
 
-logging:
-  level:
-    org.hibernate.SQL: DEBUG
-
 ---
-# Profile for production
+# Production profile
 spring:
   config:
     activate:

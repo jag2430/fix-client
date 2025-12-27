@@ -1,16 +1,15 @@
 package com.example.client.service;
 
-import com.example.client.entity.OrderEntity;
 import com.example.client.model.AmendRequest;
 import com.example.client.model.CancelRequest;
 import com.example.client.model.OrderRequest;
 import com.example.client.model.OrderResponse;
 import com.example.client.model.SessionStatus;
-import com.example.client.repository.OrderRepository;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Lazy;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 import quickfix.*;
 import quickfix.field.*;
 import quickfix.fix44.NewOrderSingle;
@@ -18,25 +17,41 @@ import quickfix.fix44.OrderCancelReplaceRequest;
 import quickfix.fix44.OrderCancelRequest;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Slf4j
 @Service
 public class OrderService {
 
-    private final SocketInitiator initiator;
-    private final OrderRepository orderRepository;
+    private static final String ORDER_KEY_PREFIX = "order:";
+    private static final String ORDERS_SET_KEY = "orders:all";
+    private static final String OPEN_ORDERS_SET_KEY = "orders:open";
 
-    public OrderService(@Lazy SocketInitiator initiator, OrderRepository orderRepository) {
+    private final SocketInitiator initiator;
+    private final RedisTemplate<String, Object> redisTemplate;
+    private final RedisPublisherService publisherService;
+
+    @Value("${redis.cache.orders-ttl:86400}")
+    private long ordersTtl;
+
+    // Local cache for sent orders
+    private final Map<String, OrderResponse> sentOrders = new ConcurrentHashMap<>();
+
+    public OrderService(@Lazy SocketInitiator initiator,
+                       RedisTemplate<String, Object> redisTemplate,
+                       RedisPublisherService publisherService) {
         this.initiator = initiator;
-        this.orderRepository = orderRepository;
+        this.redisTemplate = redisTemplate;
+        this.publisherService = publisherService;
     }
 
-    @Transactional
     public OrderResponse sendOrder(OrderRequest request) throws SessionNotFound {
         SessionID sessionId = getActiveSession();
 
@@ -47,11 +62,11 @@ public class OrderService {
         String clOrdId = generateClOrdId();
 
         NewOrderSingle order = new NewOrderSingle(
-                new ClOrdID(clOrdId),
-                new Side(request.getSide().equalsIgnoreCase("BUY") ? Side.BUY : Side.SELL),
-                new TransactTime(LocalDateTime.now()),
-                new OrdType(request.getOrderType().equalsIgnoreCase("MARKET")
-                        ? OrdType.MARKET : OrdType.LIMIT)
+            new ClOrdID(clOrdId),
+            new Side(request.getSide().equalsIgnoreCase("BUY") ? Side.BUY : Side.SELL),
+            new TransactTime(LocalDateTime.now()),
+            new OrdType(request.getOrderType().equalsIgnoreCase("MARKET")
+                ? OrdType.MARKET : OrdType.LIMIT)
         );
 
         order.set(new Symbol(request.getSymbol()));
@@ -67,30 +82,32 @@ public class OrderService {
 
         Session.sendToTarget(order, sessionId);
 
-        // Save to database
-        OrderEntity entity = OrderEntity.builder()
-                .clOrdId(clOrdId)
-                .symbol(request.getSymbol())
-                .side(request.getSide().toUpperCase())
-                .orderType(request.getOrderType().toUpperCase())
-                .quantity(request.getQuantity())
-                .price(request.getPrice())
-                .status("PENDING")
-                .filledQuantity(0)
-                .leavesQuantity(request.getQuantity())
-                .timestamp(LocalDateTime.now())
-                .build();
+        OrderResponse response = OrderResponse.builder()
+            .clOrdId(clOrdId)
+            .symbol(request.getSymbol())
+            .side(request.getSide().toUpperCase())
+            .orderType(request.getOrderType().toUpperCase())
+            .quantity(request.getQuantity())
+            .price(request.getPrice())
+            .status("PENDING")
+            .leavesQuantity(request.getQuantity())
+            .filledQuantity(0)
+            .timestamp(LocalDateTime.now())
+            .build();
 
-        orderRepository.save(entity);
+        // Store locally and in Redis
+        saveOrder(response);
+
+        // Publish order event
+        publisherService.publishOrderUpdate(response, "ORDER_NEW");
 
         log.info("Sent order: {} {} {} {} @ {}",
-                clOrdId, request.getSide(), request.getQuantity(),
-                request.getSymbol(), request.getPrice());
+            clOrdId, request.getSide(), request.getQuantity(),
+            request.getSymbol(), request.getPrice());
 
-        return toResponse(entity);
+        return response;
     }
 
-    @Transactional
     public OrderResponse cancelOrder(CancelRequest request) throws SessionNotFound {
         SessionID sessionId = getActiveSession();
 
@@ -101,10 +118,10 @@ public class OrderService {
         String clOrdId = generateClOrdId();
 
         OrderCancelRequest cancelRequest = new OrderCancelRequest(
-                new OrigClOrdID(request.getOriginalClOrdId()),
-                new ClOrdID(clOrdId),
-                new Side(request.getSide().equalsIgnoreCase("BUY") ? Side.BUY : Side.SELL),
-                new TransactTime(LocalDateTime.now())
+            new OrigClOrdID(request.getOriginalClOrdId()),
+            new ClOrdID(clOrdId),
+            new Side(request.getSide().equalsIgnoreCase("BUY") ? Side.BUY : Side.SELL),
+            new TransactTime(LocalDateTime.now())
         );
 
         cancelRequest.set(new Symbol(request.getSymbol()));
@@ -113,25 +130,26 @@ public class OrderService {
         Session.sendToTarget(cancelRequest, sessionId);
 
         // Mark the ORIGINAL order as pending cancel
-        orderRepository.findById(request.getOriginalClOrdId()).ifPresent(original -> {
+        OrderResponse original = sentOrders.get(request.getOriginalClOrdId());
+        if (original != null) {
             original.setStatus("PENDING_CANCEL");
-            orderRepository.save(original);
-        });
+            saveOrder(original);
+            publisherService.publishOrderUpdate(original, "ORDER_PENDING_CANCEL");
+        }
 
         OrderResponse response = OrderResponse.builder()
-                .clOrdId(clOrdId)
-                .symbol(request.getSymbol())
-                .side(request.getSide().toUpperCase())
-                .status("PENDING_CANCEL")
-                .timestamp(LocalDateTime.now())
-                .build();
+            .clOrdId(clOrdId)
+            .symbol(request.getSymbol())
+            .side(request.getSide().toUpperCase())
+            .status("PENDING_CANCEL")
+            .timestamp(LocalDateTime.now())
+            .build();
 
         log.info("Sent cancel request: {} for original order {}", clOrdId, request.getOriginalClOrdId());
 
         return response;
     }
 
-    @Transactional
     public OrderResponse amendOrder(AmendRequest request) throws SessionNotFound {
         SessionID sessionId = getActiveSession();
 
@@ -139,100 +157,112 @@ public class OrderService {
             throw new IllegalStateException("No active FIX session available");
         }
 
-        // Get the original order from database
-        OrderEntity originalOrder = orderRepository.findById(request.getOriginalClOrdId())
-                .orElseThrow(() -> new IllegalArgumentException(
-                        "Original order not found: " + request.getOriginalClOrdId()));
+        OrderResponse originalOrder = sentOrders.get(request.getOriginalClOrdId());
+        if (originalOrder == null) {
+            throw new IllegalArgumentException("Original order not found: " + request.getOriginalClOrdId());
+        }
 
         String clOrdId = generateClOrdId();
 
         OrderCancelReplaceRequest amendRequest = new OrderCancelReplaceRequest(
-                new OrigClOrdID(request.getOriginalClOrdId()),
-                new ClOrdID(clOrdId),
-                new Side(request.getSide().equalsIgnoreCase("BUY") ? Side.BUY : Side.SELL),
-                new TransactTime(LocalDateTime.now()),
-                new OrdType(originalOrder.getOrderType().equalsIgnoreCase("MARKET")
-                        ? OrdType.MARKET : OrdType.LIMIT)
+            new OrigClOrdID(request.getOriginalClOrdId()),
+            new ClOrdID(clOrdId),
+            new Side(request.getSide().equalsIgnoreCase("BUY") ? Side.BUY : Side.SELL),
+            new TransactTime(LocalDateTime.now()),
+            new OrdType(originalOrder.getOrderType().equalsIgnoreCase("MARKET")
+                ? OrdType.MARKET : OrdType.LIMIT)
         );
 
         amendRequest.set(new Symbol(request.getSymbol()));
 
         int effectiveQty = request.getNewQuantity() != null
-                ? request.getNewQuantity()
-                : originalOrder.getQuantity();
+            ? request.getNewQuantity()
+            : originalOrder.getQuantity();
         amendRequest.set(new OrderQty(effectiveQty));
 
         BigDecimal effectivePrice = request.getNewPrice() != null
-                ? request.getNewPrice()
-                : originalOrder.getPrice();
+            ? request.getNewPrice()
+            : originalOrder.getPrice();
         if (effectivePrice != null) {
             amendRequest.set(new Price(effectivePrice.doubleValue()));
         }
 
         Session.sendToTarget(amendRequest, sessionId);
 
-        // Save new order to database
-        OrderEntity newEntity = OrderEntity.builder()
-                .clOrdId(clOrdId)
-                .symbol(request.getSymbol())
-                .side(request.getSide().toUpperCase())
-                .orderType(originalOrder.getOrderType())
-                .quantity(effectiveQty)
-                .price(effectivePrice)
-                .status("PENDING_REPLACE")
-                .filledQuantity(0)
-                .leavesQuantity(effectiveQty)
-                .timestamp(LocalDateTime.now())
-                .build();
+        OrderResponse response = OrderResponse.builder()
+            .clOrdId(clOrdId)
+            .symbol(request.getSymbol())
+            .side(request.getSide().toUpperCase())
+            .orderType(originalOrder.getOrderType())
+            .quantity(effectiveQty)
+            .price(effectivePrice)
+            .status("PENDING_REPLACE")
+            .timestamp(LocalDateTime.now())
+            .build();
 
-        orderRepository.save(newEntity);
+        saveOrder(response);
+        publisherService.publishOrderUpdate(response, "ORDER_PENDING_REPLACE");
 
         log.info("Sent amend request: {} for original order {} newQty={} newPrice={}",
-                clOrdId, request.getOriginalClOrdId(), effectiveQty, effectivePrice);
+            clOrdId, request.getOriginalClOrdId(), effectiveQty, effectivePrice);
 
-        return toResponse(newEntity);
+        return response;
     }
 
-    @Transactional
+    /**
+     * Update order status based on execution report.
+     */
     public void updateOrderStatus(String clOrdId, String status, int filledQty, int leavesQty) {
-        orderRepository.findById(clOrdId).ifPresent(order -> {
+        OrderResponse order = sentOrders.get(clOrdId);
+        if (order != null) {
             order.setStatus(status);
             order.setFilledQuantity(filledQty);
             order.setLeavesQuantity(leavesQty);
-            orderRepository.save(order);
+            saveOrder(order);
+            publisherService.publishOrderUpdate(order, "ORDER_" + status);
             log.debug("Updated order {} status to {}", clOrdId, status);
-        });
+        }
     }
 
-    @Transactional
+    /**
+     * Handle order replacement
+     */
     public void handleOrderReplaced(String origClOrdId, String newClOrdId, String status,
-                                    int filledQty, int leavesQty) {
-        // Mark old order as replaced
-        orderRepository.findById(origClOrdId).ifPresent(oldOrder -> {
+                                   int filledQty, int leavesQty) {
+        OrderResponse oldOrder = sentOrders.get(origClOrdId);
+        if (oldOrder != null) {
             oldOrder.setStatus("REPLACED");
-            orderRepository.save(oldOrder);
-        });
+            saveOrder(oldOrder);
+            publisherService.publishOrderUpdate(oldOrder, "ORDER_REPLACED");
+        }
 
-        // Update new order
         updateOrderStatus(newClOrdId, status, filledQty, leavesQty);
-
         log.debug("Order replaced: {} -> {}", origClOrdId, newClOrdId);
     }
 
-    @Transactional
     public void updateOrderStatusForCancel(String origClOrdId, String status, int filledQty, int leavesQty) {
-        orderRepository.findById(origClOrdId).ifPresent(order -> {
+        OrderResponse order = sentOrders.get(origClOrdId);
+        if (order != null) {
             order.setStatus(status);
             order.setFilledQuantity(filledQty);
             order.setLeavesQuantity(leavesQty);
-            orderRepository.save(order);
+            saveOrder(order);
+            publisherService.publishOrderUpdate(order, "ORDER_" + status);
             log.debug("Updated ORIGINAL order {} status to {}", origClOrdId, status);
-        });
+        } else {
+            log.warn("Cancel update: original order {} not found in sentOrders", origClOrdId);
+        }
     }
 
-    @Transactional
     public void removeOrder(String clOrdId) {
-        orderRepository.deleteById(clOrdId);
+        sentOrders.remove(clOrdId);
+        try {
+            redisTemplate.delete(ORDER_KEY_PREFIX + clOrdId);
+            redisTemplate.opsForSet().remove(ORDERS_SET_KEY, clOrdId);
+            redisTemplate.opsForSet().remove(OPEN_ORDERS_SET_KEY, clOrdId);
+        } catch (Exception e) {
+            log.warn("Failed to remove order from Redis: {}", e.getMessage());
+        }
         log.debug("Removed order {} from tracking", clOrdId);
     }
 
@@ -242,37 +272,81 @@ public class OrderService {
         for (SessionID sessionId : initiator.getSessions()) {
             Session session = Session.lookupSession(sessionId);
             statuses.add(SessionStatus.builder()
-                    .sessionId(sessionId.toString())
-                    .loggedOn(session != null && session.isLoggedOn())
-                    .senderCompId(sessionId.getSenderCompID())
-                    .targetCompId(sessionId.getTargetCompID())
-                    .build());
+                .sessionId(sessionId.toString())
+                .loggedOn(session != null && session.isLoggedOn())
+                .senderCompId(sessionId.getSenderCompID())
+                .targetCompId(sessionId.getTargetCompID())
+                .build());
         }
 
         return statuses;
     }
 
-    @Transactional(readOnly = true)
     public List<OrderResponse> getSentOrders() {
-        return orderRepository.findAllByOrderByTimestampDesc()
-                .stream()
-                .map(this::toResponse)
-                .collect(Collectors.toList());
+        return new ArrayList<>(sentOrders.values());
     }
 
-    @Transactional(readOnly = true)
     public List<OrderResponse> getOpenOrders() {
-        return orderRepository.findOpenOrdersOrderByTimestampDesc()
-                .stream()
-                .map(this::toResponse)
-                .collect(Collectors.toList());
+        return sentOrders.values().stream()
+            .filter(order -> {
+                String status = order.getStatus();
+                return status != null &&
+                    !status.equals("FILLED") &&
+                    !status.equals("CANCELLED") &&
+                    !status.equals("REJECTED") &&
+                    !status.equals("REPLACED");
+            })
+            .collect(Collectors.toList());
     }
 
-    @Transactional(readOnly = true)
     public OrderResponse getOrderByClOrdId(String clOrdId) {
-        return orderRepository.findById(clOrdId)
-                .map(this::toResponse)
-                .orElse(null);
+        // Check local cache first
+        OrderResponse order = sentOrders.get(clOrdId);
+        if (order != null) {
+            return order;
+        }
+
+        // Try Redis
+        try {
+            Object cached = redisTemplate.opsForValue().get(ORDER_KEY_PREFIX + clOrdId);
+            if (cached instanceof OrderResponse) {
+                order = (OrderResponse) cached;
+                sentOrders.put(clOrdId, order);
+                return order;
+            }
+        } catch (Exception e) {
+            log.warn("Failed to get order from Redis: {}", e.getMessage());
+        }
+
+        return null;
+    }
+
+    private void saveOrder(OrderResponse order) {
+        String clOrdId = order.getClOrdId();
+        sentOrders.put(clOrdId, order);
+
+        try {
+            // Save to Redis
+            redisTemplate.opsForValue().set(
+                ORDER_KEY_PREFIX + clOrdId,
+                order,
+                Duration.ofSeconds(ordersTtl)
+            );
+
+            // Track in sets
+            redisTemplate.opsForSet().add(ORDERS_SET_KEY, clOrdId);
+
+            // Update open orders set
+            String status = order.getStatus();
+            if (status != null && !status.equals("FILLED") && !status.equals("CANCELLED") &&
+                !status.equals("REJECTED") && !status.equals("REPLACED")) {
+                redisTemplate.opsForSet().add(OPEN_ORDERS_SET_KEY, clOrdId);
+            } else {
+                redisTemplate.opsForSet().remove(OPEN_ORDERS_SET_KEY, clOrdId);
+            }
+        } catch (Exception e) {
+            log.warn("Failed to save order to Redis: {}", e.getMessage());
+        }
     }
 
     private SessionID getActiveSession() {
@@ -287,20 +361,5 @@ public class OrderService {
 
     private String generateClOrdId() {
         return UUID.randomUUID().toString().substring(0, 8).toUpperCase();
-    }
-
-    private OrderResponse toResponse(OrderEntity entity) {
-        return OrderResponse.builder()
-                .clOrdId(entity.getClOrdId())
-                .symbol(entity.getSymbol())
-                .side(entity.getSide())
-                .orderType(entity.getOrderType())
-                .quantity(entity.getQuantity())
-                .price(entity.getPrice())
-                .status(entity.getStatus())
-                .filledQuantity(entity.getFilledQuantity())
-                .leavesQuantity(entity.getLeavesQuantity())
-                .timestamp(entity.getTimestamp())
-                .build();
     }
 }

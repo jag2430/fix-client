@@ -1,41 +1,69 @@
 # FIX Client Application
 
-A Spring Boot application that provides a REST API interface to send FIX orders to an exchange using QuickFIX/J with PostgreSQL persistence.
+A Spring Boot application that provides a REST API interface to send FIX orders to an exchange using QuickFIX/J, with Redis caching, real-time position tracking, and WebSocket-based portfolio blotter.
 
 ## Features
 
 - FIX 4.4 protocol support
 - REST API for sending orders and cancellations
+- **Redis caching** for orders, executions, and positions
+- **Redis pub/sub** for real-time updates
+- **WebSocket portfolio blotter** for live position monitoring
+- **Position tracking** with P&L calculations
+- **Market data integration** (Alpaca ready)
 - Execution report tracking
 - Session status monitoring
 - Support for MARKET and LIMIT orders
-- **PostgreSQL database persistence** - Orders and executions survive restarts
-- **Docker support** for PostgreSQL database
+
+## Architecture
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   REST Client   │     │ WebSocket Client│     │  Alpaca API     │
+│   (curl/UI)     │     │ (Blotter)       │     │  (Market Data)  │
+└────────┬────────┘     └────────┬────────┘     └────────┬────────┘
+         │                       │                       │
+         ▼                       ▼                       ▼
+┌────────────────────────────────────────────────────────────────┐
+│                     FIX Client Application                      │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
+│  │ OrderService │  │PositionSvc  │  │ MarketDataService    │  │
+│  │              │  │              │  │ (Alpaca/NoOp)        │  │
+│  └──────┬───────┘  └──────┬───────┘  └──────────┬───────────┘  │
+│         │                 │                      │              │
+│         ▼                 ▼                      ▼              │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │              Redis (Cache + Pub/Sub)                     │   │
+│  │  • positions:updates  • executions:updates  • orders:*   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+└────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────┐
+│  FIX Exchange   │
+│  (Port 9876)    │
+└─────────────────┘
+```
 
 ## Prerequisites
 
 - Java 17+
 - Maven 3.6+
-- Docker and Docker Compose (for PostgreSQL)
+- Redis 6+ (or use Docker)
 - Running FIX Exchange Simulator (on port 9876)
+- (Optional) Alpaca API credentials for market data
 
 ## Quick Start
 
-### 1. Start PostgreSQL Database
+### 1. Start Redis
 
 ```bash
-# Start PostgreSQL in Docker
+# Using Docker Compose (recommended)
 docker-compose up -d
 
-# Verify it's running
-docker-compose ps
+# Or start Redis directly
+docker run -d --name redis -p 6379:6379 redis:7-alpine
 ```
-
-The PostgreSQL container will:
-- Create a database named `fixclient`
-- Create user `fixuser` with password `fixpassword`
-- Expose port 5432
-- Persist data in a Docker volume
 
 ### 2. Build the Application
 
@@ -45,81 +73,27 @@ mvn clean package
 
 ### 3. Run the Application
 
-Make sure the exchange simulator is running first, then:
-
 ```bash
+# Without market data
 mvn spring-boot:run
+
+# With Alpaca market data
+ALPACA_API_KEY=your_key ALPACA_API_SECRET=your_secret \
+MARKET_DATA_PROVIDER=alpaca mvn spring-boot:run
 ```
 
 The client will:
-- Connect to PostgreSQL on localhost:5432
 - Connect to the exchange on localhost:9876
+- Connect to Redis on localhost:6379
 - Start a REST API on port 8081
-
-## Docker Commands
-
-```bash
-# Start PostgreSQL
-docker-compose up -d
-
-# Stop PostgreSQL (keeps data)
-docker-compose stop
-
-# Stop and remove containers (keeps data volume)
-docker-compose down
-
-# Stop and remove everything including data
-docker-compose down -v
-
-# View PostgreSQL logs
-docker-compose logs -f postgres
-
-# Connect to PostgreSQL CLI
-docker exec -it fix-client-postgres psql -U fixuser -d fixclient
-```
-
-## Database Schema
-
-The application uses JPA/Hibernate to automatically create and manage tables:
-
-### Orders Table
-| Column | Type | Description |
-|--------|------|-------------|
-| cl_ord_id | VARCHAR(36) | Primary key - Client Order ID |
-| symbol | VARCHAR(20) | Trading symbol (e.g., AAPL) |
-| side | VARCHAR(10) | BUY or SELL |
-| order_type | VARCHAR(10) | MARKET or LIMIT |
-| quantity | INT | Order quantity |
-| price | DECIMAL(19,4) | Limit price |
-| status | VARCHAR(20) | Order status |
-| filled_quantity | INT | Filled quantity |
-| leaves_quantity | INT | Remaining quantity |
-| timestamp | TIMESTAMP | Creation time |
-| updated_at | TIMESTAMP | Last update time |
-
-### Executions Table
-| Column | Type | Description |
-|--------|------|-------------|
-| exec_id | VARCHAR(50) | Primary key - Execution ID |
-| order_id | VARCHAR(50) | Exchange order ID |
-| cl_ord_id | VARCHAR(36) | Client Order ID |
-| orig_cl_ord_id | VARCHAR(36) | Original order ID (for cancel/replace) |
-| symbol | VARCHAR(20) | Trading symbol |
-| side | VARCHAR(10) | BUY or SELL |
-| exec_type | VARCHAR(20) | Execution type |
-| order_status | VARCHAR(20) | Order status |
-| last_price | DECIMAL(19,4) | Last execution price |
-| last_quantity | INT | Last execution quantity |
-| leaves_quantity | INT | Remaining quantity |
-| cum_quantity | INT | Cumulative filled quantity |
-| avg_price | DECIMAL(19,4) | Average fill price |
-| timestamp | TIMESTAMP | Execution time |
+- Start a WebSocket server on port 8081
 
 ## REST API Endpoints
 
-### Send Order
+### Orders
+
 ```bash
-# Limit Order
+# Send Limit Order
 curl -X POST http://localhost:8081/api/orders \
   -H "Content-Type: application/json" \
   -d '{
@@ -130,7 +104,7 @@ curl -X POST http://localhost:8081/api/orders \
     "price": 150.00
   }'
 
-# Market Order
+# Send Market Order
 curl -X POST http://localhost:8081/api/orders \
   -H "Content-Type: application/json" \
   -d '{
@@ -139,197 +113,294 @@ curl -X POST http://localhost:8081/api/orders \
     "orderType": "MARKET",
     "quantity": 50
   }'
-```
 
-### Cancel Order
-```bash
+# Cancel Order
 curl -X DELETE "http://localhost:8081/api/orders/{clOrdId}?symbol=AAPL&side=BUY"
-```
 
-### Amend Order
-```bash
-curl -X PUT "http://localhost:8081/api/orders/{clOrdId}" \
+# Amend Order
+curl -X PUT http://localhost:8081/api/orders/{clOrdId} \
   -H "Content-Type: application/json" \
   -d '{
     "symbol": "AAPL",
     "side": "BUY",
-    "newQuantity": 200,
-    "newPrice": 155.00
+    "newQuantity": 150,
+    "newPrice": 148.00
   }'
-```
 
-### Get Orders
-```bash
-# All orders
+# Get All Orders
 curl http://localhost:8081/api/orders
 
-# Open orders only
+# Get Open Orders Only
 curl "http://localhost:8081/api/orders?openOnly=true"
-curl http://localhost:8081/api/orders/open
 
-# Specific order
+# Get Specific Order
 curl http://localhost:8081/api/orders/{clOrdId}
 ```
 
-### Get Executions
+### Executions
+
 ```bash
-# All executions (limited to 100)
+# All executions
 curl http://localhost:8081/api/executions
 
 # Executions for specific order
 curl "http://localhost:8081/api/executions?clOrdId=ABC123"
 
-# Recent executions with custom limit
+# Recent executions with limit
 curl "http://localhost:8081/api/executions?limit=10"
 
 # Execution count
 curl http://localhost:8081/api/executions/count
 ```
 
-### Session Status
+### Portfolio & Positions
+
 ```bash
-curl http://localhost:8081/api/sessions
+# Get Portfolio Summary
+curl http://localhost:8081/api/portfolio/summary
+
+# Get All Positions
+curl http://localhost:8081/api/portfolio/positions
+
+# Get Open Positions Only
+curl "http://localhost:8081/api/portfolio/positions?openOnly=true"
+
+# Get Position for Symbol
+curl http://localhost:8081/api/portfolio/positions/AAPL
+
+# Manually Update Price (for testing)
+curl -X POST http://localhost:8081/api/portfolio/positions/AAPL/price \
+  -H "Content-Type: application/json" \
+  -d '{"price": 155.00}'
+
+# Clear All Positions
+curl -X DELETE http://localhost:8081/api/portfolio/positions
 ```
 
-### Health Check
+### Market Data
+
 ```bash
+# Get Market Data Status
+curl http://localhost:8081/api/portfolio/market-data/status
+
+# Get Latest Market Data for Symbol
+curl http://localhost:8081/api/portfolio/market-data/AAPL
+
+# Subscribe to Market Data
+curl -X POST http://localhost:8081/api/portfolio/market-data/subscribe \
+  -H "Content-Type: application/json" \
+  -d '{"symbols": ["AAPL", "MSFT", "GOOGL"]}'
+
+# Unsubscribe from Market Data
+curl -X POST http://localhost:8081/api/portfolio/market-data/unsubscribe \
+  -H "Content-Type: application/json" \
+  -d '{"symbols": ["AAPL"]}'
+```
+
+### Session & Health
+
+```bash
+# Session Status
+curl http://localhost:8081/api/sessions
+
+# Health Check
 curl http://localhost:8081/api/health
+```
+
+## WebSocket Portfolio Blotter
+
+Connect to the WebSocket endpoint to receive real-time updates:
+
+```javascript
+const ws = new WebSocket('ws://localhost:8081/ws/portfolio');
+
+ws.onopen = () => {
+  console.log('Connected to portfolio blotter');
+  
+  // Request current portfolio snapshot
+  ws.send(JSON.stringify({ action: 'getPortfolio' }));
+  
+  // Subscribe to specific channel
+  ws.send(JSON.stringify({ 
+    action: 'subscribe', 
+    channel: 'positions:updates' 
+  }));
+};
+
+ws.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  console.log('Received:', data);
+  
+  switch (data.type) {
+    case 'PORTFOLIO_SNAPSHOT':
+      updatePortfolioUI(data.data);
+      break;
+    case 'POSITION_UPDATE':
+      updatePositionRow(data.data);
+      break;
+    case 'EXECUTION':
+      addExecutionToBlotter(data.data);
+      break;
+    case 'ORDER_NEW':
+    case 'ORDER_FILLED':
+    case 'ORDER_CANCELLED':
+      updateOrderStatus(data.data);
+      break;
+  }
+};
+
+// Keep connection alive
+setInterval(() => {
+  ws.send(JSON.stringify({ action: 'ping' }));
+}, 30000);
+```
+
+### WebSocket Message Types
+
+| Type | Description |
+|------|-------------|
+| `PORTFOLIO_SNAPSHOT` | Complete portfolio state on connect |
+| `POSITION_UPDATE` | Real-time position changes |
+| `EXECUTION` | New execution reports |
+| `ORDER_NEW` | New order acknowledged |
+| `ORDER_FILLED` | Order fully filled |
+| `ORDER_PARTIAL_FILL` | Order partially filled |
+| `ORDER_CANCELLED` | Order cancelled |
+| `ORDER_REJECTED` | Order rejected |
+
+## Redis Channels
+
+Subscribe to these Redis pub/sub channels for updates:
+
+| Channel | Description |
+|---------|-------------|
+| `positions:updates` | Position changes (qty, P&L) |
+| `executions:updates` | New execution reports |
+| `orders:updates` | Order status changes |
+
+### Subscribe via redis-cli
+
+```bash
+redis-cli SUBSCRIBE positions:updates executions:updates orders:updates
 ```
 
 ## Configuration
 
-### Application Configuration
-Edit `src/main/resources/application.yml`:
+### application.yml
 
 ```yaml
-spring:
-  datasource:
-    url: jdbc:postgresql://localhost:5432/fixclient
-    username: fixuser
-    password: fixpassword
-```
+server:
+  port: 8081
 
-### FIX Configuration
-Edit `src/main/resources/quickfix-client.cfg`:
-- Exchange host/port
-- SenderCompID/TargetCompID
-- Heartbeat interval
+fix:
+  config-file: quickfix-client.cfg
+
+spring:
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+
+redis:
+  channels:
+    positions: positions:updates
+    executions: executions:updates
+    orders: orders:updates
+
+market-data:
+  provider: ${MARKET_DATA_PROVIDER:none}  # none, alpaca
+  alpaca:
+    api-key: ${ALPACA_API_KEY:}
+    api-secret: ${ALPACA_API_SECRET:}
+    base-url: https://paper-api.alpaca.markets
+    data-url: wss://stream.data.alpaca.markets/v2
+    feed: iex  # iex (free) or sip (paid)
+```
 
 ### Environment Variables
-You can override database settings with environment variables:
 
-```bash
-export SPRING_DATASOURCE_URL=jdbc:postgresql://myhost:5432/mydb
-export SPRING_DATASOURCE_USERNAME=myuser
-export SPRING_DATASOURCE_PASSWORD=mypassword
-mvn spring-boot:run
-```
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `REDIS_HOST` | Redis server host | localhost |
+| `REDIS_PORT` | Redis server port | 6379 |
+| `REDIS_PASSWORD` | Redis password | (empty) |
+| `MARKET_DATA_PROVIDER` | Market data provider | none |
+| `ALPACA_API_KEY` | Alpaca API key | (empty) |
+| `ALPACA_API_SECRET` | Alpaca API secret | (empty) |
 
 ## Project Structure
 
 ```
 fix-client/
-├── docker-compose.yml          # PostgreSQL Docker configuration
-├── init-db.sql                 # Database initialization script
+├── docker-compose.yml           # Redis setup
 ├── pom.xml
 ├── src/
 │   ├── main/
 │   │   ├── java/com/example/client/
 │   │   │   ├── FixClientApplication.java
 │   │   │   ├── config/
-│   │   │   │   └── FixConfig.java
+│   │   │   │   ├── FixConfig.java
+│   │   │   │   ├── RedisConfig.java
+│   │   │   │   └── WebSocketConfig.java
 │   │   │   ├── controller/
-│   │   │   │   └── OrderController.java
-│   │   │   ├── entity/                    # NEW: JPA Entities
-│   │   │   │   ├── OrderEntity.java
-│   │   │   │   └── ExecutionEntity.java
+│   │   │   │   ├── OrderController.java
+│   │   │   │   └── PortfolioController.java
 │   │   │   ├── fix/
 │   │   │   │   └── ClientFixApplication.java
 │   │   │   ├── model/
 │   │   │   │   ├── AmendRequest.java
 │   │   │   │   ├── CancelRequest.java
 │   │   │   │   ├── ExecutionMessage.java
+│   │   │   │   ├── MarketDataUpdate.java
 │   │   │   │   ├── OrderRequest.java
 │   │   │   │   ├── OrderResponse.java
+│   │   │   │   ├── Position.java
+│   │   │   │   ├── PortfolioSummary.java
 │   │   │   │   └── SessionStatus.java
-│   │   │   ├── repository/                # NEW: JPA Repositories
-│   │   │   │   ├── OrderRepository.java
-│   │   │   │   └── ExecutionRepository.java
-│   │   │   └── service/
-│   │   │       ├── ExecutionService.java  # Updated for JPA
-│   │   │       └── OrderService.java      # Updated for JPA
+│   │   │   ├── service/
+│   │   │   │   ├── AlpacaMarketDataService.java
+│   │   │   │   ├── ExecutionService.java
+│   │   │   │   ├── MarketDataService.java
+│   │   │   │   ├── NoOpMarketDataService.java
+│   │   │   │   ├── OrderService.java
+│   │   │   │   ├── PositionService.java
+│   │   │   │   └── RedisPublisherService.java
+│   │   │   └── websocket/
+│   │   │       └── PortfolioWebSocketHandler.java
 │   │   └── resources/
-│   │       ├── application.yml            # Updated with DB config
+│   │       ├── application.yml
 │   │       └── quickfix-client.cfg
 ```
 
 ## Example Workflow
 
-1. Start PostgreSQL:
-   ```bash
-   docker-compose up -d
-   ```
-
-2. Start the exchange simulator
-
-3. Start this client:
-   ```bash
-   mvn spring-boot:run
-   ```
-
-4. Send a limit buy order:
+1. Start Redis and exchange simulator
+2. Start this client
+3. Send a limit buy order:
    ```bash
    curl -X POST http://localhost:8081/api/orders \
      -H "Content-Type: application/json" \
      -d '{"symbol":"AAPL","side":"BUY","orderType":"LIMIT","quantity":100,"price":150.00}'
    ```
-
-5. Check orders (persisted in database):
+4. Check portfolio positions:
    ```bash
-   curl http://localhost:8081/api/orders
+   curl http://localhost:8081/api/portfolio/summary
    ```
-
-6. Restart the application - orders will still be there!
-
-7. Query the database directly:
+5. Send a sell order to match:
    ```bash
-   docker exec -it fix-client-postgres psql -U fixuser -d fixclient -c "SELECT * FROM orders;"
+   curl -X POST http://localhost:8081/api/orders \
+     -H "Content-Type: application/json" \
+     -d '{"symbol":"AAPL","side":"SELL","orderType":"LIMIT","quantity":50,"price":149.00}'
    ```
+6. Watch positions update in real-time via WebSocket
 
-## Profiles
+## Monitoring with Redis Commander
 
-The application supports multiple profiles:
-
-```bash
-# Development (verbose logging)
-mvn spring-boot:run -Dspring-boot.run.profiles=dev
-
-# Production (minimal logging, validates schema)
-mvn spring-boot:run -Dspring-boot.run.profiles=prod
-```
-
-## Troubleshooting
-
-### Database Connection Issues
-```bash
-# Check if PostgreSQL is running
-docker-compose ps
-
-# Check PostgreSQL logs
-docker-compose logs postgres
-
-# Test connection
-docker exec -it fix-client-postgres psql -U fixuser -d fixclient -c "SELECT 1;"
-```
-
-### Reset Database
-```bash
-# Stop containers and remove volumes
-docker-compose down -v
-
-# Start fresh
-docker-compose up -d
-```
+Access the Redis Commander UI at http://localhost:8085 to view:
+- Cached orders and positions
+- Pub/sub activity
+- Key expiration
 
 ## License
 
