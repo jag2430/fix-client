@@ -57,24 +57,21 @@ redis:
     orders-ttl: 86400
 
 # Market Data Configuration
-# Options: none, yahoo, alpaca
+# Options: none, finnhub
 market-data:
-  provider: ${MARKET_DATA_PROVIDER:yahoo}
+  provider: ${MARKET_DATA_PROVIDER:finnhub}
 
-  # Yahoo Finance Configuration (Free, no API key required)
-  yahoo:
-    # How often to refresh quotes (in milliseconds)
-    refresh-interval-ms: ${YAHOO_REFRESH_INTERVAL:5000}
+  # Finnhub Configuration (Free tier: 60 calls/min REST, free WebSocket)
+  # Get your FREE API key at: https://finnhub.io/register
+  finnhub:
+    api-key: d58rhg9r01qvj8iiggc0d58rhg9r01qvj8iiggcg
+    # Use WebSocket for real-time trades (recommended)
+    use-websocket: ${FINNHUB_USE_WEBSOCKET:true}
+    # REST API polling interval (only used if WebSocket disabled)
+    refresh-interval-ms: ${FINNHUB_REFRESH_INTERVAL:5000}
     # How long to cache quotes in Redis (in seconds)
-    cache-ttl-seconds: ${YAHOO_CACHE_TTL:300}
+    cache-ttl-seconds: ${FINNHUB_CACHE_TTL:300}
 
-  # Alpaca Configuration (requires API key)
-  alpaca:
-    api-key: ${ALPACA_API_KEY:}
-    api-secret: ${ALPACA_API_SECRET:}
-    base-url: ${ALPACA_BASE_URL:https://paper-api.alpaca.markets}
-    data-url: ${ALPACA_DATA_URL:wss://stream.data.alpaca.markets/v2}
-    feed: iex
 
 logging:
   level:
@@ -93,7 +90,7 @@ spring:
     show-sql: true
 
 market-data:
-  yahoo:
+  finnhub:
     refresh-interval-ms: 10000  # Slower refresh in dev
 
 ---
@@ -108,7 +105,7 @@ spring:
     show-sql: false
 
 market-data:
-  yahoo:
+  finnhub:
     refresh-interval-ms: 5000
 
 logging:

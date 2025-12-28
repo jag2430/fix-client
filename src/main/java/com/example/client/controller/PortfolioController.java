@@ -3,9 +3,9 @@ package com.example.client.controller;
 import com.example.client.model.MarketDataUpdate;
 import com.example.client.model.Position;
 import com.example.client.model.PortfolioSummary;
+import com.example.client.service.FinnhubMarketDataService;
 import com.example.client.service.MarketDataService;
 import com.example.client.service.PositionService;
-import com.example.client.service.YahooFinanceMarketDataService;
 import com.example.client.websocket.PortfolioWebSocketHandler;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -100,10 +100,11 @@ public class PortfolioController {
     response.put("provider", marketDataService.getProviderName());
     response.put("connected", marketDataService.isConnected());
 
-    // If Yahoo Finance service, get all cached quotes
-    if (marketDataService instanceof YahooFinanceMarketDataService yahooService) {
-      response.put("subscriptions", yahooService.getSubscribedSymbols());
-      response.put("quotes", yahooService.getAllCachedQuotes());
+    // If Finnhub service, get additional info
+    if (marketDataService instanceof FinnhubMarketDataService finnhubService) {
+      response.put("subscriptions", finnhubService.getSubscribedSymbols());
+      response.put("quotes", finnhubService.getAllCachedQuotes());
+      response.put("webSocketConnected", finnhubService.isWebSocketConnected());
     }
 
     return ResponseEntity.ok(response);
@@ -125,11 +126,17 @@ public class PortfolioController {
     marketDataService.subscribeTrades(upperSymbols);
     marketDataService.subscribeQuotes(upperSymbols);
 
-    return ResponseEntity.ok(Map.of(
-        "message", "Subscribed to market data",
-        "symbols", upperSymbols,
-        "provider", marketDataService.getProviderName()
-    ));
+    Map<String, Object> response = new HashMap<>();
+    response.put("message", "Subscribed to market data");
+    response.put("symbols", upperSymbols);
+    response.put("provider", marketDataService.getProviderName());
+
+    // Add WebSocket status for Finnhub
+    if (marketDataService instanceof FinnhubMarketDataService finnhubService) {
+      response.put("webSocketConnected", finnhubService.isWebSocketConnected());
+    }
+
+    return ResponseEntity.ok(response);
   }
 
   @PostMapping("/market-data/unsubscribe")
@@ -155,11 +162,12 @@ public class PortfolioController {
     status.put("provider", marketDataService.getProviderName());
     status.put("connected", marketDataService.isConnected());
 
-    // Add Yahoo Finance specific info
-    if (marketDataService instanceof YahooFinanceMarketDataService yahooService) {
-      Set<String> subscriptions = yahooService.getSubscribedSymbols();
+    // Add Finnhub specific info
+    if (marketDataService instanceof FinnhubMarketDataService finnhubService) {
+      Set<String> subscriptions = finnhubService.getSubscribedSymbols();
       status.put("subscribedSymbols", subscriptions);
       status.put("subscriptionCount", subscriptions.size());
+      status.put("webSocketConnected", finnhubService.isWebSocketConnected());
     }
 
     return ResponseEntity.ok(status);
@@ -167,10 +175,11 @@ public class PortfolioController {
 
   @GetMapping("/market-data/subscriptions")
   public ResponseEntity<?> getSubscriptions() {
-    if (marketDataService instanceof YahooFinanceMarketDataService yahooService) {
+    if (marketDataService instanceof FinnhubMarketDataService finnhubService) {
       return ResponseEntity.ok(Map.of(
           "provider", marketDataService.getProviderName(),
-          "subscriptions", yahooService.getSubscribedSymbols()
+          "subscriptions", finnhubService.getSubscribedSymbols(),
+          "webSocketConnected", finnhubService.isWebSocketConnected()
       ));
     }
 

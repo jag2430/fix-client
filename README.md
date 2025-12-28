@@ -10,8 +10,7 @@ A Spring Boot application that provides a REST API interface to send FIX orders 
 - **Redis pub/sub** for real-time updates
 - **WebSocket portfolio blotter** for live position monitoring
 - **Position tracking** with P&L calculations
-- **Yahoo Finance market data integration** (free, no API key required)
-- **Alpaca market data support** (optional, requires API key)
+- **Finnhub market data integration** (free, requires API key sign-up)
 - Execution report tracking
 - Session status monitoring
 - Support for MARKET and LIMIT orders
@@ -20,16 +19,16 @@ A Spring Boot application that provides a REST API interface to send FIX orders 
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   REST Client   │     │ WebSocket Client│     │ Yahoo Finance   │
-│   (curl/UI)     │     │ (Blotter)       │     │   (Free API)    │
+│   REST Client   │     │ WebSocket Client│     │    Finnhub      │
+│   (curl/UI)     │     │ (Blotter)       │     │ (Free API Key)  │
 └────────┬────────┘     └────────┬────────┘     └────────┬────────┘
          │                       │                       │
          ▼                       ▼                       ▼
 ┌────────────────────────────────────────────────────────────────┐
 │                     FIX Client Application                     │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
-│  │ OrderService │  │PositionSvc   │  │ YahooFinanceService  │  │
-│  │              │  │              │  │ (Market Data)        │  │
+│  │ OrderService │  │PositionSvc   │  │ FinnhubMarketDataSvc │  │
+│  │              │  │              │  │ (REST + WebSocket)   │  │
 │  └──────┬───────┘  └──────┬───────┘  └──────────┬───────────┘  │
 │         │                 │                     │              │
 │         ▼                 ▼                     ▼              │
@@ -54,10 +53,17 @@ A Spring Boot application that provides a REST API interface to send FIX orders 
 - Maven 3.6+
 - Redis 6+ (or use Docker)
 - Running FIX Exchange Simulator (on port 9876)
+- **Finnhub API Key** (free): https://finnhub.io/register
 
 ## Quick Start
 
-### 1. Start Redis
+### 1. Get Your Free Finnhub API Key
+
+1. Go to https://finnhub.io/register
+2. Sign up with email (no credit card required)
+3. Copy your API key from the dashboard
+
+### 2. Start Redis
 
 ```bash
 # Using Docker Compose (recommended)
@@ -67,27 +73,23 @@ docker-compose up -d
 docker run -d --name redis -p 6379:6379 redis:7-alpine
 ```
 
-### 2. Build the Application
+### 3. Build the Application
 
 ```bash
 mvn clean package
 ```
 
-### 3. Run the Application
+### 4. Run the Application
 
 ```bash
-# With Yahoo Finance market data (default, no API key needed)
-mvn spring-boot:run
+# With Finnhub market data (recommended)
+FINNHUB_API_KEY=your_api_key_here mvn spring-boot:run
 
-# Or explicitly set provider
-MARKET_DATA_PROVIDER=yahoo mvn spring-boot:run
+# Or set in application.yml
+# market-data.finnhub.api-key: your_api_key_here
 
 # Without market data
 MARKET_DATA_PROVIDER=none mvn spring-boot:run
-
-# With Alpaca market data (requires API keys)
-ALPACA_API_KEY=your_key ALPACA_API_SECRET=your_secret \
-MARKET_DATA_PROVIDER=alpaca mvn spring-boot:run
 ```
 
 The client will:
@@ -95,7 +97,46 @@ The client will:
 - Connect to Redis on localhost:6379
 - Start a REST API on port 8081
 - Start a WebSocket server on port 8081
-- Start fetching market data from Yahoo Finance (if enabled)
+- Connect to Finnhub WebSocket for real-time trades
+
+## Finnhub Market Data
+
+### Free Tier Limits
+- **REST API**: 60 calls/minute
+- **WebSocket**: Unlimited real-time trades for US stocks, forex, crypto
+- **No credit card required**
+
+### Features
+- Real-time trade streaming via WebSocket
+- Quote data via REST API (current price, open, high, low, previous close)
+- Automatic reconnection on disconnect
+- Redis caching for persistence
+- Position P&L updates in real-time
+
+### Configuration Options
+
+```yaml
+market-data:
+  provider: finnhub
+  finnhub:
+    api-key: ${FINNHUB_API_KEY:}
+    use-websocket: true          # Enable WebSocket streaming
+    refresh-interval-ms: 5000    # REST polling interval (fallback)
+    cache-ttl-seconds: 300       # Redis cache TTL
+```
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `FINNHUB_API_KEY` | Your Finnhub API key | (required) |
+| `FINNHUB_USE_WEBSOCKET` | Enable WebSocket streaming | true |
+| `FINNHUB_REFRESH_INTERVAL` | REST API polling interval (ms) | 5000 |
+| `FINNHUB_CACHE_TTL` | Redis cache TTL (seconds) | 300 |
+| `REDIS_HOST` | Redis server host | localhost |
+| `REDIS_PORT` | Redis server port | 6379 |
+| `REDIS_PASSWORD` | Redis password | (empty) |
+| `MARKET_DATA_PROVIDER` | Market data provider (finnhub/none) | finnhub |
 
 ## REST API Endpoints
 
@@ -186,7 +227,7 @@ curl -X POST http://localhost:8081/api/portfolio/positions/AAPL/price \
 curl -X DELETE http://localhost:8081/api/portfolio/positions
 ```
 
-### Market Data (Yahoo Finance)
+### Market Data (Finnhub)
 
 ```bash
 # Get Market Data Status
@@ -198,7 +239,7 @@ curl http://localhost:8081/api/portfolio/market-data
 # Get Latest Market Data for Symbol
 curl http://localhost:8081/api/portfolio/market-data/AAPL
 
-# Subscribe to Market Data (quotes refresh every 5 seconds)
+# Subscribe to Market Data (WebSocket + REST)
 curl -X POST http://localhost:8081/api/portfolio/market-data/subscribe \
   -H "Content-Type: application/json" \
   -d '{"symbols": ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]}'
@@ -285,7 +326,7 @@ setInterval(() => {
 | `PORTFOLIO_SNAPSHOT` | Complete portfolio state on connect |
 | `POSITION_UPDATE` | Real-time position changes |
 | `EXECUTION` | New execution reports |
-| `MARKET_DATA` | Real-time price updates from Yahoo Finance |
+| `MARKET_DATA` | Real-time price updates from Finnhub |
 | `ORDER_NEW` | New order acknowledged |
 | `ORDER_FILLED` | Order fully filled |
 | `ORDER_PARTIAL_FILL` | Order partially filled |
@@ -320,99 +361,47 @@ setInterval(() => {
 redis-cli SUBSCRIBE positions:updates executions:updates orders:updates marketdata:updates
 ```
 
-## Configuration
+## Example Workflow
 
-### application.yml
+1. Start Redis and exchange simulator
+2. Set your Finnhub API key and start the client:
+   ```bash
+   FINNHUB_API_KEY=your_key mvn spring-boot:run
+   ```
+3. Subscribe to market data:
+   ```bash
+   curl -X POST http://localhost:8081/api/portfolio/market-data/subscribe \
+     -H "Content-Type: application/json" \
+     -d '{"symbols": ["AAPL", "MSFT", "GOOGL"]}'
+   ```
+4. Send a limit buy order:
+   ```bash
+   curl -X POST http://localhost:8081/api/orders \
+     -H "Content-Type: application/json" \
+     -d '{"symbol":"AAPL","side":"BUY","orderType":"LIMIT","quantity":100,"price":150.00}'
+   ```
+5. Check portfolio positions (with live prices from Finnhub):
+   ```bash
+   curl http://localhost:8081/api/portfolio/summary
+   ```
+6. Watch positions update in real-time via WebSocket as market prices change
 
-```yaml
-server:
-  port: 8081
-
-fix:
-  config-file: quickfix-client.cfg
-
-spring:
-  data:
-    redis:
-      host: ${REDIS_HOST:localhost}
-      port: ${REDIS_PORT:6379}
-      password: ${REDIS_PASSWORD:}
-
-redis:
-  channels:
-    positions: positions:updates
-    executions: executions:updates
-    orders: orders:updates
-    marketdata: marketdata:updates
-
-market-data:
-  provider: ${MARKET_DATA_PROVIDER:yahoo}  # none, yahoo, alpaca
-  yahoo:
-    refresh-interval-ms: 5000   # How often to fetch quotes
-    cache-ttl-seconds: 300      # Redis cache TTL
-  alpaca:
-    api-key: ${ALPACA_API_KEY:}
-    api-secret: ${ALPACA_API_SECRET:}
-    base-url: https://paper-api.alpaca.markets
-    data-url: wss://stream.data.alpaca.markets/v2
-    feed: iex
-```
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `REDIS_HOST` | Redis server host | localhost |
-| `REDIS_PORT` | Redis server port | 6379 |
-| `REDIS_PASSWORD` | Redis password | (empty) |
-| `MARKET_DATA_PROVIDER` | Market data provider (yahoo/alpaca/none) | yahoo |
-| `YAHOO_REFRESH_INTERVAL` | Yahoo quote refresh interval (ms) | 5000 |
-| `YAHOO_CACHE_TTL` | Yahoo quote cache TTL (seconds) | 300 |
-| `ALPACA_API_KEY` | Alpaca API key (if using Alpaca) | (empty) |
-| `ALPACA_API_SECRET` | Alpaca API secret (if using Alpaca) | (empty) |
-
-## Yahoo Finance Market Data
-
-The Yahoo Finance integration provides:
-
-- **Real-time quotes** for US equities (refreshes every 5 seconds)
-- **No API key required** - uses public Yahoo Finance API
-- **Cached in Redis** for fast access and persistence
-- **Automatic position updates** - P&L recalculates on price changes
-- **WebSocket broadcast** - clients receive updates in real-time
-
-### Available Quote Fields
-
-| Field | Description |
-|-------|-------------|
-| `price` | Current market price |
-| `bidPrice` | Current bid |
-| `askPrice` | Current ask |
-| `bidSize` / `askSize` | Bid/ask sizes |
-| `volume` | Trading volume |
-| `open` / `high` / `low` | OHLC data |
-| `previousClose` | Previous close |
-| `change` / `changePercent` | Price change |
-
-### Example Response
+## Finnhub Quote Response Example
 
 ```json
 {
   "symbol": "AAPL",
-  "provider": "Yahoo Finance",
+  "provider": "Finnhub",
   "quote": {
     "symbol": "AAPL",
     "price": 178.5500,
-    "bidPrice": 178.5400,
-    "askPrice": 178.5600,
-    "volume": 45234567,
     "open": 177.2500,
     "high": 179.1200,
     "low": 176.8900,
     "previousClose": 177.0100,
     "change": 1.5400,
     "changePercent": 0.8700,
-    "source": "yahoo",
+    "source": "finnhub",
     "updateType": "QUOTE",
     "timestamp": "2024-01-15T14:30:25"
   }
@@ -449,42 +438,19 @@ fix-client/
 │   │   │   │   ├── PortfolioSummary.java
 │   │   │   │   └── SessionStatus.java
 │   │   │   ├── service/
-│   │   │   │   ├── AlpacaMarketDataService.java
 │   │   │   │   ├── ExecutionService.java
+│   │   │   │   ├── FinnhubMarketDataService.java
 │   │   │   │   ├── MarketDataService.java
 │   │   │   │   ├── NoOpMarketDataService.java
 │   │   │   │   ├── OrderService.java
 │   │   │   │   ├── PositionService.java
-│   │   │   │   ├── RedisPublisherService.java
-│   │   │   │   └── YahooFinanceMarketDataService.java  # NEW
+│   │   │   │   └── RedisPublisherService.java
 │   │   │   └── websocket/
 │   │   │       └── PortfolioWebSocketHandler.java
 │   │   └── resources/
 │   │       ├── application.yml
 │   │       └── quickfix-client.cfg
 ```
-
-## Example Workflow
-
-1. Start Redis and exchange simulator
-2. Start this client (Yahoo Finance enabled by default)
-3. Subscribe to market data:
-   ```bash
-   curl -X POST http://localhost:8081/api/portfolio/market-data/subscribe \
-     -H "Content-Type: application/json" \
-     -d '{"symbols": ["AAPL", "MSFT", "GOOGL"]}'
-   ```
-4. Send a limit buy order:
-   ```bash
-   curl -X POST http://localhost:8081/api/orders \
-     -H "Content-Type: application/json" \
-     -d '{"symbol":"AAPL","side":"BUY","orderType":"LIMIT","quantity":100,"price":150.00}'
-   ```
-5. Check portfolio positions (with live prices from Yahoo):
-   ```bash
-   curl http://localhost:8081/api/portfolio/summary
-   ```
-6. Watch positions update in real-time via WebSocket as market prices change
 
 ## Monitoring with Redis Commander
 
@@ -494,6 +460,20 @@ Access the Redis Commander UI at http://localhost:8085 to view:
 - Subscribed symbols (`marketdata:subscriptions`)
 - Pub/sub activity
 - Key expiration
+
+## Troubleshooting
+
+### "Finnhub API key not configured"
+Make sure you've set the `FINNHUB_API_KEY` environment variable or configured it in `application.yml`.
+
+### "Rate limit reached"
+The free tier allows 60 REST API calls per minute. If you're hitting rate limits:
+- Enable WebSocket mode (default): `FINNHUB_USE_WEBSOCKET=true`
+- Increase refresh interval: `FINNHUB_REFRESH_INTERVAL=10000`
+- Reduce number of subscribed symbols
+
+### WebSocket not connecting
+Check that your API key is valid and not expired. The WebSocket URL requires a valid token.
 
 ## License
 
