@@ -6,11 +6,12 @@ A Spring Boot application that provides a REST API interface to send FIX orders 
 
 - FIX 4.4 protocol support
 - REST API for sending orders and cancellations
-- **Redis caching** for orders, executions, and positions
+- **Redis caching** for orders, executions, positions, and market data
 - **Redis pub/sub** for real-time updates
 - **WebSocket portfolio blotter** for live position monitoring
 - **Position tracking** with P&L calculations
-- **Market data integration** (Alpaca ready)
+- **Yahoo Finance market data integration** (free, no API key required)
+- **Alpaca market data support** (optional, requires API key)
 - Execution report tracking
 - Session status monitoring
 - Support for MARKET and LIMIT orders
@@ -19,22 +20,24 @@ A Spring Boot application that provides a REST API interface to send FIX orders 
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   REST Client   │     │ WebSocket Client│     │  Alpaca API     │
-│   (curl/UI)     │     │ (Blotter)       │     │  (Market Data)  │
+│   REST Client   │     │ WebSocket Client│     │ Yahoo Finance   │
+│   (curl/UI)     │     │ (Blotter)       │     │   (Free API)    │
 └────────┬────────┘     └────────┬────────┘     └────────┬────────┘
          │                       │                       │
          ▼                       ▼                       ▼
 ┌────────────────────────────────────────────────────────────────┐
 │                     FIX Client Application                     │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
-│  │ OrderService │  │PositionSvc   │  │ MarketDataService    │  │
-│  │              │  │              │  │ (Alpaca/NoOp)        │  │
+│  │ OrderService │  │PositionSvc   │  │ YahooFinanceService  │  │
+│  │              │  │              │  │ (Market Data)        │  │
 │  └──────┬───────┘  └──────┬───────┘  └──────────┬───────────┘  │
 │         │                 │                     │              │
 │         ▼                 ▼                     ▼              │
 │  ┌─────────────────────────────────────────────────────────┐   │
 │  │              Redis (Cache + Pub/Sub)                    │   │
-│  │  • positions:updates  • executions:updates  • orders:*  │   │
+│  │  • positions:updates  • executions:updates              │   │
+│  │  • orders:updates     • marketdata:updates              │   │
+│  │  • marketdata:quote:* • marketdata:subscriptions        │   │
 │  └─────────────────────────────────────────────────────────┘   │
 └────────────────────────────────────────────────────────────────┘
          │
@@ -51,7 +54,6 @@ A Spring Boot application that provides a REST API interface to send FIX orders 
 - Maven 3.6+
 - Redis 6+ (or use Docker)
 - Running FIX Exchange Simulator (on port 9876)
-- (Optional) Alpaca API credentials for market data
 
 ## Quick Start
 
@@ -74,10 +76,16 @@ mvn clean package
 ### 3. Run the Application
 
 ```bash
-# Without market data
+# With Yahoo Finance market data (default, no API key needed)
 mvn spring-boot:run
 
-# With Alpaca market data
+# Or explicitly set provider
+MARKET_DATA_PROVIDER=yahoo mvn spring-boot:run
+
+# Without market data
+MARKET_DATA_PROVIDER=none mvn spring-boot:run
+
+# With Alpaca market data (requires API keys)
 ALPACA_API_KEY=your_key ALPACA_API_SECRET=your_secret \
 MARKET_DATA_PROVIDER=alpaca mvn spring-boot:run
 ```
@@ -87,6 +95,7 @@ The client will:
 - Connect to Redis on localhost:6379
 - Start a REST API on port 8081
 - Start a WebSocket server on port 8081
+- Start fetching market data from Yahoo Finance (if enabled)
 
 ## REST API Endpoints
 
@@ -177,17 +186,28 @@ curl -X POST http://localhost:8081/api/portfolio/positions/AAPL/price \
 curl -X DELETE http://localhost:8081/api/portfolio/positions
 ```
 
-### Market Data
+### Market Data (Yahoo Finance)
 
 ```bash
 # Get Market Data Status
 curl http://localhost:8081/api/portfolio/market-data/status
 
+# Get All Market Data (quotes and subscriptions)
+curl http://localhost:8081/api/portfolio/market-data
+
 # Get Latest Market Data for Symbol
 curl http://localhost:8081/api/portfolio/market-data/AAPL
 
-# Subscribe to Market Data
+# Subscribe to Market Data (quotes refresh every 5 seconds)
 curl -X POST http://localhost:8081/api/portfolio/market-data/subscribe \
+  -H "Content-Type: application/json" \
+  -d '{"symbols": ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]}'
+
+# Get Current Subscriptions
+curl http://localhost:8081/api/portfolio/market-data/subscriptions
+
+# Batch Quote Request
+curl -X POST http://localhost:8081/api/portfolio/market-data/quotes \
   -H "Content-Type: application/json" \
   -d '{"symbols": ["AAPL", "MSFT", "GOOGL"]}'
 
@@ -220,10 +240,10 @@ ws.onopen = () => {
   // Request current portfolio snapshot
   ws.send(JSON.stringify({ action: 'getPortfolio' }));
   
-  // Subscribe to specific channel
+  // Subscribe to market data channel
   ws.send(JSON.stringify({ 
     action: 'subscribe', 
-    channel: 'positions:updates' 
+    channel: 'marketdata:updates' 
   }));
 };
 
@@ -240,6 +260,9 @@ ws.onmessage = (event) => {
       break;
     case 'EXECUTION':
       addExecutionToBlotter(data.data);
+      break;
+    case 'MARKET_DATA':
+      updateMarketPrice(data.data);
       break;
     case 'ORDER_NEW':
     case 'ORDER_FILLED':
@@ -262,26 +285,39 @@ setInterval(() => {
 | `PORTFOLIO_SNAPSHOT` | Complete portfolio state on connect |
 | `POSITION_UPDATE` | Real-time position changes |
 | `EXECUTION` | New execution reports |
+| `MARKET_DATA` | Real-time price updates from Yahoo Finance |
 | `ORDER_NEW` | New order acknowledged |
 | `ORDER_FILLED` | Order fully filled |
 | `ORDER_PARTIAL_FILL` | Order partially filled |
 | `ORDER_CANCELLED` | Order cancelled |
 | `ORDER_REJECTED` | Order rejected |
 
-## Redis Channels
+## Redis Data Structure
 
-Subscribe to these Redis pub/sub channels for updates:
+### Cached Keys
+
+| Key Pattern | Description | TTL |
+|-------------|-------------|-----|
+| `marketdata:quote:{symbol}` | Latest quote for symbol | 5 min |
+| `marketdata:trade:{symbol}` | Latest trade for symbol | 5 min |
+| `marketdata:subscriptions` | Set of subscribed symbols | None |
+| `position:{symbol}` | Position data | 1 hour |
+| `order:{clOrdId}` | Order data | 24 hours |
+| `executions:list` | List of all executions | 24 hours |
+
+### Pub/Sub Channels
 
 | Channel | Description |
 |---------|-------------|
 | `positions:updates` | Position changes (qty, P&L) |
 | `executions:updates` | New execution reports |
 | `orders:updates` | Order status changes |
+| `marketdata:updates` | Real-time market data updates |
 
 ### Subscribe via redis-cli
 
 ```bash
-redis-cli SUBSCRIBE positions:updates executions:updates orders:updates
+redis-cli SUBSCRIBE positions:updates executions:updates orders:updates marketdata:updates
 ```
 
 ## Configuration
@@ -307,15 +343,19 @@ redis:
     positions: positions:updates
     executions: executions:updates
     orders: orders:updates
+    marketdata: marketdata:updates
 
 market-data:
-  provider: ${MARKET_DATA_PROVIDER:none}  # none, alpaca
+  provider: ${MARKET_DATA_PROVIDER:yahoo}  # none, yahoo, alpaca
+  yahoo:
+    refresh-interval-ms: 5000   # How often to fetch quotes
+    cache-ttl-seconds: 300      # Redis cache TTL
   alpaca:
     api-key: ${ALPACA_API_KEY:}
     api-secret: ${ALPACA_API_SECRET:}
     base-url: https://paper-api.alpaca.markets
     data-url: wss://stream.data.alpaca.markets/v2
-    feed: iex  # iex (free) or sip (paid)
+    feed: iex
 ```
 
 ### Environment Variables
@@ -325,15 +365,65 @@ market-data:
 | `REDIS_HOST` | Redis server host | localhost |
 | `REDIS_PORT` | Redis server port | 6379 |
 | `REDIS_PASSWORD` | Redis password | (empty) |
-| `MARKET_DATA_PROVIDER` | Market data provider | none |
-| `ALPACA_API_KEY` | Alpaca API key | (empty) |
-| `ALPACA_API_SECRET` | Alpaca API secret | (empty) |
+| `MARKET_DATA_PROVIDER` | Market data provider (yahoo/alpaca/none) | yahoo |
+| `YAHOO_REFRESH_INTERVAL` | Yahoo quote refresh interval (ms) | 5000 |
+| `YAHOO_CACHE_TTL` | Yahoo quote cache TTL (seconds) | 300 |
+| `ALPACA_API_KEY` | Alpaca API key (if using Alpaca) | (empty) |
+| `ALPACA_API_SECRET` | Alpaca API secret (if using Alpaca) | (empty) |
+
+## Yahoo Finance Market Data
+
+The Yahoo Finance integration provides:
+
+- **Real-time quotes** for US equities (refreshes every 5 seconds)
+- **No API key required** - uses public Yahoo Finance API
+- **Cached in Redis** for fast access and persistence
+- **Automatic position updates** - P&L recalculates on price changes
+- **WebSocket broadcast** - clients receive updates in real-time
+
+### Available Quote Fields
+
+| Field | Description |
+|-------|-------------|
+| `price` | Current market price |
+| `bidPrice` | Current bid |
+| `askPrice` | Current ask |
+| `bidSize` / `askSize` | Bid/ask sizes |
+| `volume` | Trading volume |
+| `open` / `high` / `low` | OHLC data |
+| `previousClose` | Previous close |
+| `change` / `changePercent` | Price change |
+
+### Example Response
+
+```json
+{
+  "symbol": "AAPL",
+  "provider": "Yahoo Finance",
+  "quote": {
+    "symbol": "AAPL",
+    "price": 178.5500,
+    "bidPrice": 178.5400,
+    "askPrice": 178.5600,
+    "volume": 45234567,
+    "open": 177.2500,
+    "high": 179.1200,
+    "low": 176.8900,
+    "previousClose": 177.0100,
+    "change": 1.5400,
+    "changePercent": 0.8700,
+    "source": "yahoo",
+    "updateType": "QUOTE",
+    "timestamp": "2024-01-15T14:30:25"
+  }
+}
+```
 
 ## Project Structure
 
 ```
 fix-client/
-├── docker-compose.yml           # Redis setup
+├── docker-compose.yml           # Redis + PostgreSQL setup
 ├── pom.xml
 ├── src/
 │   ├── main/
@@ -365,7 +455,8 @@ fix-client/
 │   │   │   │   ├── NoOpMarketDataService.java
 │   │   │   │   ├── OrderService.java
 │   │   │   │   ├── PositionService.java
-│   │   │   │   └── RedisPublisherService.java
+│   │   │   │   ├── RedisPublisherService.java
+│   │   │   │   └── YahooFinanceMarketDataService.java  # NEW
 │   │   │   └── websocket/
 │   │   │       └── PortfolioWebSocketHandler.java
 │   │   └── resources/
@@ -376,29 +467,31 @@ fix-client/
 ## Example Workflow
 
 1. Start Redis and exchange simulator
-2. Start this client
-3. Send a limit buy order:
+2. Start this client (Yahoo Finance enabled by default)
+3. Subscribe to market data:
+   ```bash
+   curl -X POST http://localhost:8081/api/portfolio/market-data/subscribe \
+     -H "Content-Type: application/json" \
+     -d '{"symbols": ["AAPL", "MSFT", "GOOGL"]}'
+   ```
+4. Send a limit buy order:
    ```bash
    curl -X POST http://localhost:8081/api/orders \
      -H "Content-Type: application/json" \
      -d '{"symbol":"AAPL","side":"BUY","orderType":"LIMIT","quantity":100,"price":150.00}'
    ```
-4. Check portfolio positions:
+5. Check portfolio positions (with live prices from Yahoo):
    ```bash
    curl http://localhost:8081/api/portfolio/summary
    ```
-5. Send a sell order to match:
-   ```bash
-   curl -X POST http://localhost:8081/api/orders \
-     -H "Content-Type: application/json" \
-     -d '{"symbol":"AAPL","side":"SELL","orderType":"LIMIT","quantity":50,"price":149.00}'
-   ```
-6. Watch positions update in real-time via WebSocket
+6. Watch positions update in real-time via WebSocket as market prices change
 
 ## Monitoring with Redis Commander
 
 Access the Redis Commander UI at http://localhost:8085 to view:
 - Cached orders and positions
+- Market data quotes (`marketdata:quote:*`)
+- Subscribed symbols (`marketdata:subscriptions`)
 - Pub/sub activity
 - Key expiration
 

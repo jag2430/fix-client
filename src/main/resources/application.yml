@@ -51,13 +51,24 @@ redis:
     positions: positions:updates
     executions: executions:updates
     orders: orders:updates
+    marketdata: marketdata:updates
   cache:
     positions-ttl: 3600
     orders-ttl: 86400
 
-# Market Data Configuration (for future Alpaca integration)
+# Market Data Configuration
+# Options: none, yahoo, alpaca
 market-data:
-  provider: ${MARKET_DATA_PROVIDER:none}
+  provider: ${MARKET_DATA_PROVIDER:yahoo}
+
+  # Yahoo Finance Configuration (Free, no API key required)
+  yahoo:
+    # How often to refresh quotes (in milliseconds)
+    refresh-interval-ms: ${YAHOO_REFRESH_INTERVAL:5000}
+    # How long to cache quotes in Redis (in seconds)
+    cache-ttl-seconds: ${YAHOO_CACHE_TTL:300}
+
+  # Alpaca Configuration (requires API key)
   alpaca:
     api-key: ${ALPACA_API_KEY:}
     api-secret: ${ALPACA_API_SECRET:}
@@ -81,6 +92,10 @@ spring:
   jpa:
     show-sql: true
 
+market-data:
+  yahoo:
+    refresh-interval-ms: 10000  # Slower refresh in dev
+
 ---
 # Production profile
 spring:
@@ -91,6 +106,10 @@ spring:
     hibernate:
       ddl-auto: validate
     show-sql: false
+
+market-data:
+  yahoo:
+    refresh-interval-ms: 5000
 
 logging:
   level:
