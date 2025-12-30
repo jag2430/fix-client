@@ -4,8 +4,10 @@ import com.example.client.model.MarketDataUpdate;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -63,9 +65,11 @@ public class FinnhubMarketDataService implements MarketDataService {
   private long cacheTtlSeconds;
 
   private final ObjectMapper objectMapper;
-  private final PositionService positionService;
   private final RedisPublisherService publisherService;
   private final RedisTemplate<String, Object> redisTemplate;
+
+  // Lazy injection to break circular dependency with PositionService
+  private PositionService positionService;
 
   private final HttpClient httpClient;
   private WebSocket webSocket;
@@ -79,16 +83,25 @@ public class FinnhubMarketDataService implements MarketDataService {
   private final ScheduledExecutorService reconnectExecutor = Executors.newSingleThreadScheduledExecutor();
 
   public FinnhubMarketDataService(ObjectMapper objectMapper,
-                                  PositionService positionService,
                                   RedisPublisherService publisherService,
                                   RedisTemplate<String, Object> redisTemplate) {
     this.objectMapper = objectMapper;
-    this.positionService = positionService;
     this.publisherService = publisherService;
     this.redisTemplate = redisTemplate;
     this.httpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(10))
         .build();
+  }
+
+  /**
+   * Lazy setter injection for PositionService to break circular dependency.
+   * PositionService -> MarketDataService -> PositionService
+   */
+  @Autowired
+  @Lazy
+  public void setPositionService(PositionService positionService) {
+    this.positionService = positionService;
+    log.debug("PositionService injected into FinnhubMarketDataService");
   }
 
   @PostConstruct
@@ -414,8 +427,8 @@ public class FinnhubMarketDataService implements MarketDataService {
     // Save to Redis cache
     saveToRedis(symbol, update);
 
-    // ALWAYS update position with latest price
-    if (update.getPrice() != null) {
+    // ALWAYS update position with latest price (if PositionService is available)
+    if (positionService != null && update.getPrice() != null) {
       positionService.updateMarketPrice(symbol, update.getPrice());
     }
 
