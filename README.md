@@ -1,51 +1,249 @@
 # FIX Client Application
 
-A Spring Boot application that provides a REST API interface to send FIX orders to an exchange using QuickFIX/J, with Redis caching, real-time position tracking, and WebSocket-based portfolio blotter.
+A Spring Boot middleware application that provides a REST API interface to send FIX orders to an exchange using QuickFIX/J, with Redis caching, real-time position tracking, P&L calculations, and market data integration.
+
+## Overview
+
+The FIX Client serves as the middleware layer between user-facing applications (Trading UI, Portfolio Blotter) and the FIX exchange. It handles protocol translation, order management, position tracking, and real-time data distribution.
 
 ## Features
 
-- FIX 4.4 protocol support
-- REST API for sending orders and cancellations
-- **Redis caching** for orders, executions, positions, and market data
-- **Redis pub/sub** for real-time updates
-- **WebSocket portfolio blotter** for live position monitoring
-- **Position tracking** with P&L calculations
-- **Finnhub market data integration** (free, requires API key sign-up)
-- Execution report tracking
-- Session status monitoring
-- Support for MARKET and LIMIT orders
+### FIX Protocol Support
+- **FIX 4.4** protocol implementation via QuickFIX/J
+- **NewOrderSingle (D)**: Submit new orders
+- **OrderCancelRequest (F)**: Cancel existing orders
+- **OrderCancelReplaceRequest (G)**: Amend orders (modify quantity/price)
+- **ExecutionReport (8)**: Process order acknowledgments and fills
+
+### Order Management
+- REST API for order submission, amendment, and cancellation
+- Order state tracking with status updates
+- Execution report processing and storage
+- Support for MARKET and LIMIT order types
+
+### Position Tracking & P&L
+- Real-time position updates from executions
+- **Weighted average cost** calculation
+- **Unrealized P&L**: (Current Price - Avg Cost) × Quantity
+- **Realized P&L**: Calculated when closing positions
+- Automatic position creation on first fill
+
+### Market Data Integration (Finnhub)
+- **REST API polling** for quote data (price, open, high, low, change)
+- **WebSocket streaming** for real-time trade prices
+- **Auto-subscription** when positions are opened
+- Redis caching with configurable TTL
+- Position P&L updates as prices change
+
+### Redis Integration
+- **Caching**: Orders, positions, executions, market data
+- **Pub/Sub**: Real-time updates to connected clients
+- Configurable TTL for different data types
+
+### WebSocket Portfolio Blotter
+- Real-time position and P&L updates
+- Execution notifications
+- Market data streaming
 
 ## Architecture
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   REST Client   │     │ WebSocket Client│     │    Finnhub      │
-│   (curl/UI)     │     │ (Blotter)       │     │ (Free API Key)  │
-└────────┬────────┘     └────────┬────────┘     └────────┬────────┘
-         │                       │                       │
-         ▼                       ▼                       ▼
-┌────────────────────────────────────────────────────────────────┐
-│                     FIX Client Application                     │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
-│  │ OrderService │  │PositionSvc   │  │ FinnhubMarketDataSvc │  │
-│  │              │  │              │  │ (REST + WebSocket)   │  │
-│  └──────┬───────┘  └──────┬───────┘  └──────────┬───────────┘  │
-│         │                 │                     │              │
-│         ▼                 ▼                     ▼              │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │              Redis (Cache + Pub/Sub)                    │   │
-│  │  • positions:updates  • executions:updates              │   │
-│  │  • orders:updates     • marketdata:updates              │   │
-│  │  • marketdata:quote:* • marketdata:subscriptions        │   │
-│  └─────────────────────────────────────────────────────────┘   │
-└────────────────────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────┐
-│  FIX Exchange   │
-│  (Port 9876)    │
-└─────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                           FIX Client Application                             │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │                         REST Controllers                               │  │
+│  │  ┌─────────────────┐  ┌──────────────────┐  ┌────────────────────────┐ │  │
+│  │  │ OrderController │   PortfolioController  │  SessionController     │ │  │
+│  │  │ POST/PUT/DELETE │  │ GET positions    │  │  GET session status    │ │  │
+│  │  │ /api/orders     │  │ /api/portfolio   │  │  /api/sessions         │ │  │
+│  │  └────────┬────────┘  └────────┬─────────┘  └────────────────────────┘ │  │
+│  └───────────┼────────────────────┼───────────────────────────────────────┘  │
+│              │                    │                                          │
+│              ▼                    ▼                                          │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │                            Services                                    │  │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐  ┌────────────┐   │  │
+│  │  │ OrderService │   PositionService  │ExecutionSvc │  │ RedisPubl. │   │  │
+│  │  │              │  │  P&L Calc    │  │             │  │  Pub/Sub   │   │  │
+│  │  └──────┬───────┘  └──────┬───────┘  └──────┬──────┘  └─────┬──────┘   │  │
+│  │         │                 │                 │               │          │  │
+│  │         │                 │                 │               ▼          │  │
+│  │         │                 │                 │         ┌────────────┐   │  │
+│  │         │                 │                 │         │   Redis    │   │  │
+│  │         │                 │                 │          Cache+Pub/Sub   │  │
+│  │         │                 │                 │         └────────────┘   │  │
+│  └─────────┼─────────────────┼─────────────────┼──────────────────────────┘  │
+│            │                 │                 │                             │
+│            ▼                 │                 │                             │
+│  ┌────────────────────────┐  │                 │                             │
+│  │  ClientFixApplication  │◀───────────────────                           
+│  │  (QuickFIX/J)          │  Execution Reports                               │
+│  │                        │                                                  │                                                                         
+│  │  - fromApp(): Handle   │                                                  │
+│  │    incoming messages   │                                                  │
+│  │  - toApp(): Intercept  │                                                  │
+│  │    outgoing messages   │                                                  │
+│  └───────────┬────────────┘                                                  │
+│              │                                                               │
+│              │ FIX 4.4 Protocol                                              │
+│              ▼                                                               │
+│  ┌────────────────────────┐      ┌────────────────────────┐                  │
+│  │   SocketInitiator      │      │  FinnhubMarketDataSvc  │                  │
+│  │   (FIX Connection)     │      │  REST + WebSocket      │                  │
+│  └───────────┬────────────┘      └───────────┬────────────┘                  │
+└──────────────┼───────────────────────────────┼───────────────────────────────┘
+               │                               │
+               ▼                               ▼
+      ┌─────────────────┐            ┌─────────────────┐
+      │  FIX Exchange   │            │    Finnhub      │
+      │  (Port 9876)    │            │  (Market Data)  │
+      └─────────────────┘            └─────────────────┘
 ```
+
+## FIX Protocol Details
+
+### Session Configuration
+
+```properties
+# quickfix-client.cfg
+[DEFAULT]
+ConnectionType=initiator
+HeartBtInt=30
+ReconnectInterval=5
+FileStorePath=target/data/fix
+FileLogPath=target/log/fix
+StartTime=00:00:00
+EndTime=00:00:00
+UseDataDictionary=Y
+DataDictionary=FIX44.xml
+
+[SESSION]
+BeginString=FIX.4.4
+SenderCompID=BANZAI
+TargetCompID=EXEC
+SocketConnectHost=localhost
+SocketConnectPort=9876
+```
+
+### Outgoing Messages (Client → Exchange)
+
+| Message | FIX Type | Purpose | Key Fields |
+|---------|----------|---------|------------|
+| NewOrderSingle | D | Submit order | ClOrdID, Symbol, Side, OrderQty, OrdType, Price |
+| OrderCancelRequest | F | Cancel order | OrigClOrdID, ClOrdID, Symbol, Side |
+| OrderCancelReplaceRequest | G | Amend order | OrigClOrdID, ClOrdID, OrderQty, Price |
+
+### Incoming Messages (Exchange → Client)
+
+| Message | FIX Type | Purpose | Key Fields |
+|---------|----------|---------|------------|
+| ExecutionReport | 8 | Order status/fills | ExecID, ExecType, OrdStatus, LastQty, LastPx, CumQty, LeavesQty |
+
+### Execution Types Handled
+
+| ExecType | Value | Description | Action |
+|----------|-------|-------------|--------|
+| NEW | 0 | Order accepted | Update order status |
+| PARTIAL_FILL | 1 | Partial execution | Update position, publish fill |
+| FILL | 2 | Full execution | Update position, publish fill |
+| CANCELLED | 4 | Order cancelled | Update order status |
+| REPLACED | 5 | Order amended | Update order details |
+| REJECTED | 8 | Order rejected | Update order status |
+
+## Redis Integration
+
+### Caching Strategy
+
+| Key Pattern | Data | TTL | Purpose |
+|-------------|------|-----|---------|
+| `order:{clOrdId}` | Order JSON | 24 hours | Order state cache |
+| `position:{symbol}` | Position JSON | 1 hour | Position cache |
+| `marketdata:quote:{symbol}` | Quote JSON | 5 minutes | Price cache |
+| `marketdata:trade:{symbol}` | Trade JSON | 5 minutes | Last trade cache |
+| `orders:all` | Set of ClOrdIds | None | Track all orders |
+| `orders:open` | Set of ClOrdIds | None | Track open orders |
+| `executions:list` | List of executions | 24 hours | Execution history |
+| `positions:symbols` | Set of symbols | None | Active positions |
+| `marketdata:subscriptions` | Set of symbols | None | Market data subscriptions |
+
+### Pub/Sub Channels
+
+| Channel | Publisher | Content | Subscribers |
+|---------|-----------|---------|-------------|
+| `positions:updates` | PositionService | Position changes (qty, P&L) | Blotter |
+| `executions:updates` | ExecutionService | New execution reports | Blotter, UI |
+| `orders:updates` | OrderService | Order status changes | Blotter, UI |
+| `marketdata:updates` | FinnhubService | Price updates | Blotter |
+
+### Message Format
+
+```json
+{
+  "type": "POSITION_UPDATE",
+  "timestamp": "2024-01-15T14:30:25.123Z",
+  "data": {
+    "symbol": "AAPL",
+    "quantity": 100,
+    "avgCost": 150.25,
+    "currentPrice": 155.00,
+    "marketValue": 15500.00,
+    "unrealizedPnl": 475.00,
+    "realizedPnl": 0.00
+  }
+}
+```
+
+## Position & P&L Calculation
+
+### Position Updates on Fill
+
+```java
+// When a BUY fill is received:
+newQuantity = currentQuantity + fillQuantity;
+newTotalCost = currentTotalCost + (fillQuantity * fillPrice);
+newAvgCost = newTotalCost / newQuantity;
+
+// When a SELL fill is received (closing position):
+realizedPnl += (fillPrice - avgCost) * fillQuantity;
+newQuantity = currentQuantity - fillQuantity;
+```
+
+### P&L Formulas
+
+| Metric | Formula |
+|--------|---------|
+| Market Value | `quantity × currentPrice` |
+| Total Cost | `quantity × avgCost` |
+| Unrealized P&L | `(currentPrice - avgCost) × quantity` |
+| Unrealized P&L % | `((currentPrice - avgCost) / avgCost) × 100` |
+| Realized P&L | Sum of closed trade profits/losses |
+
+## Market Data (Finnhub)
+
+### Features
+- **REST Polling**: Fetches quotes every 5 seconds for subscribed symbols
+- **WebSocket**: Real-time trade stream for instant price updates
+- **Auto-Subscribe**: When a position is opened, automatically subscribes to market data
+- **Price Cache**: Redis caching to reduce API calls
+
+### Configuration
+
+```yaml
+market-data:
+  provider: finnhub
+  finnhub:
+    api-key: ${FINNHUB_API_KEY:}
+    use-websocket: true
+    refresh-interval-ms: 5000
+    cache-ttl-seconds: 300
+```
+
+### Free Tier Limits
+- **REST API**: 60 calls/minute
+- **WebSocket**: Unlimited real-time trades for US stocks
+- **No credit card required**
 
 ## Prerequisites
 
@@ -85,9 +283,6 @@ mvn clean package
 # With Finnhub market data (recommended)
 FINNHUB_API_KEY=your_api_key_here mvn spring-boot:run
 
-# Or set in application.yml
-# market-data.finnhub.api-key: your_api_key_here
-
 # Without market data
 MARKET_DATA_PROVIDER=none mvn spring-boot:run
 ```
@@ -96,47 +291,7 @@ The client will:
 - Connect to the exchange on localhost:9876
 - Connect to Redis on localhost:6379
 - Start a REST API on port 8081
-- Start a WebSocket server on port 8081
-- Connect to Finnhub WebSocket for real-time trades
-
-## Finnhub Market Data
-
-### Free Tier Limits
-- **REST API**: 60 calls/minute
-- **WebSocket**: Unlimited real-time trades for US stocks, forex, crypto
-- **No credit card required**
-
-### Features
-- Real-time trade streaming via WebSocket
-- Quote data via REST API (current price, open, high, low, previous close)
-- Automatic reconnection on disconnect
-- Redis caching for persistence
-- Position P&L updates in real-time
-
-### Configuration Options
-
-```yaml
-market-data:
-  provider: finnhub
-  finnhub:
-    api-key: ${FINNHUB_API_KEY:}
-    use-websocket: true          # Enable WebSocket streaming
-    refresh-interval-ms: 5000    # REST polling interval (fallback)
-    cache-ttl-seconds: 300       # Redis cache TTL
-```
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `FINNHUB_API_KEY` | Your Finnhub API key | (required) |
-| `FINNHUB_USE_WEBSOCKET` | Enable WebSocket streaming | true |
-| `FINNHUB_REFRESH_INTERVAL` | REST API polling interval (ms) | 5000 |
-| `FINNHUB_CACHE_TTL` | Redis cache TTL (seconds) | 300 |
-| `REDIS_HOST` | Redis server host | localhost |
-| `REDIS_PORT` | Redis server port | 6379 |
-| `REDIS_PASSWORD` | Redis password | (empty) |
-| `MARKET_DATA_PROVIDER` | Market data provider (finnhub/none) | finnhub |
+- Connect to Finnhub for market data
 
 ## REST API Endpoints
 
@@ -227,30 +382,22 @@ curl -X POST http://localhost:8081/api/portfolio/positions/AAPL/price \
 curl -X DELETE http://localhost:8081/api/portfolio/positions
 ```
 
-### Market Data (Finnhub)
+### Market Data
 
 ```bash
 # Get Market Data Status
 curl http://localhost:8081/api/portfolio/market-data/status
 
-# Get All Market Data (quotes and subscriptions)
-curl http://localhost:8081/api/portfolio/market-data
-
-# Get Latest Market Data for Symbol
-curl http://localhost:8081/api/portfolio/market-data/AAPL
-
-# Subscribe to Market Data (WebSocket + REST)
+# Subscribe to Market Data
 curl -X POST http://localhost:8081/api/portfolio/market-data/subscribe \
   -H "Content-Type: application/json" \
-  -d '{"symbols": ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]}'
+  -d '{"symbols": ["AAPL", "MSFT", "GOOGL"]}'
 
 # Get Current Subscriptions
 curl http://localhost:8081/api/portfolio/market-data/subscriptions
 
-# Batch Quote Request
-curl -X POST http://localhost:8081/api/portfolio/market-data/quotes \
-  -H "Content-Type: application/json" \
-  -d '{"symbols": ["AAPL", "MSFT", "GOOGL"]}'
+# Get Latest Market Data for Symbol
+curl http://localhost:8081/api/portfolio/market-data/AAPL
 
 # Unsubscribe from Market Data
 curl -X POST http://localhost:8081/api/portfolio/market-data/unsubscribe \
@@ -270,27 +417,13 @@ curl http://localhost:8081/api/health
 
 ## WebSocket Portfolio Blotter
 
-Connect to the WebSocket endpoint to receive real-time updates:
+Connect to receive real-time updates:
 
 ```javascript
 const ws = new WebSocket('ws://localhost:8081/ws/portfolio');
 
-ws.onopen = () => {
-  console.log('Connected to portfolio blotter');
-  
-  // Request current portfolio snapshot
-  ws.send(JSON.stringify({ action: 'getPortfolio' }));
-  
-  // Subscribe to market data channel
-  ws.send(JSON.stringify({ 
-    action: 'subscribe', 
-    channel: 'marketdata:updates' 
-  }));
-};
-
 ws.onmessage = (event) => {
   const data = JSON.parse(event.data);
-  console.log('Received:', data);
   
   switch (data.type) {
     case 'PORTFOLIO_SNAPSHOT':
@@ -305,108 +438,22 @@ ws.onmessage = (event) => {
     case 'MARKET_DATA':
       updateMarketPrice(data.data);
       break;
-    case 'ORDER_NEW':
-    case 'ORDER_FILLED':
-    case 'ORDER_CANCELLED':
-      updateOrderStatus(data.data);
-      break;
   }
 };
-
-// Keep connection alive
-setInterval(() => {
-  ws.send(JSON.stringify({ action: 'ping' }));
-}, 30000);
 ```
 
-### WebSocket Message Types
+## Environment Variables
 
-| Type | Description |
-|------|-------------|
-| `PORTFOLIO_SNAPSHOT` | Complete portfolio state on connect |
-| `POSITION_UPDATE` | Real-time position changes |
-| `EXECUTION` | New execution reports |
-| `MARKET_DATA` | Real-time price updates from Finnhub |
-| `ORDER_NEW` | New order acknowledged |
-| `ORDER_FILLED` | Order fully filled |
-| `ORDER_PARTIAL_FILL` | Order partially filled |
-| `ORDER_CANCELLED` | Order cancelled |
-| `ORDER_REJECTED` | Order rejected |
-
-## Redis Data Structure
-
-### Cached Keys
-
-| Key Pattern | Description | TTL |
-|-------------|-------------|-----|
-| `marketdata:quote:{symbol}` | Latest quote for symbol | 5 min |
-| `marketdata:trade:{symbol}` | Latest trade for symbol | 5 min |
-| `marketdata:subscriptions` | Set of subscribed symbols | None |
-| `position:{symbol}` | Position data | 1 hour |
-| `order:{clOrdId}` | Order data | 24 hours |
-| `executions:list` | List of all executions | 24 hours |
-
-### Pub/Sub Channels
-
-| Channel | Description |
-|---------|-------------|
-| `positions:updates` | Position changes (qty, P&L) |
-| `executions:updates` | New execution reports |
-| `orders:updates` | Order status changes |
-| `marketdata:updates` | Real-time market data updates |
-
-### Subscribe via redis-cli
-
-```bash
-redis-cli SUBSCRIBE positions:updates executions:updates orders:updates marketdata:updates
-```
-
-## Example Workflow
-
-1. Start Redis and exchange simulator
-2. Set your Finnhub API key and start the client:
-   ```bash
-   FINNHUB_API_KEY=your_key mvn spring-boot:run
-   ```
-3. Subscribe to market data:
-   ```bash
-   curl -X POST http://localhost:8081/api/portfolio/market-data/subscribe \
-     -H "Content-Type: application/json" \
-     -d '{"symbols": ["AAPL", "MSFT", "GOOGL"]}'
-   ```
-4. Send a limit buy order:
-   ```bash
-   curl -X POST http://localhost:8081/api/orders \
-     -H "Content-Type: application/json" \
-     -d '{"symbol":"AAPL","side":"BUY","orderType":"LIMIT","quantity":100,"price":150.00}'
-   ```
-5. Check portfolio positions (with live prices from Finnhub):
-   ```bash
-   curl http://localhost:8081/api/portfolio/summary
-   ```
-6. Watch positions update in real-time via WebSocket as market prices change
-
-## Finnhub Quote Response Example
-
-```json
-{
-  "symbol": "AAPL",
-  "provider": "Finnhub",
-  "quote": {
-    "symbol": "AAPL",
-    "price": 178.5500,
-    "open": 177.2500,
-    "high": 179.1200,
-    "low": 176.8900,
-    "previousClose": 177.0100,
-    "change": 1.5400,
-    "changePercent": 0.8700,
-    "source": "finnhub",
-    "updateType": "QUOTE",
-    "timestamp": "2024-01-15T14:30:25"
-  }
-}
-```
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `FINNHUB_API_KEY` | Finnhub API key | (required for market data) |
+| `FINNHUB_USE_WEBSOCKET` | Enable WebSocket streaming | true |
+| `FINNHUB_REFRESH_INTERVAL` | REST polling interval (ms) | 5000 |
+| `FINNHUB_CACHE_TTL` | Redis cache TTL (seconds) | 300 |
+| `REDIS_HOST` | Redis server host | localhost |
+| `REDIS_PORT` | Redis server port | 6379 |
+| `REDIS_PASSWORD` | Redis password | (empty) |
+| `MARKET_DATA_PROVIDER` | Provider (finnhub/none) | finnhub |
 
 ## Project Structure
 
@@ -428,53 +475,50 @@ fix-client/
 │   │   │   ├── fix/
 │   │   │   │   └── ClientFixApplication.java
 │   │   │   ├── model/
-│   │   │   │   ├── AmendRequest.java
-│   │   │   │   ├── CancelRequest.java
 │   │   │   │   ├── ExecutionMessage.java
-│   │   │   │   ├── MarketDataUpdate.java
 │   │   │   │   ├── OrderRequest.java
 │   │   │   │   ├── OrderResponse.java
-│   │   │   │   ├── Position.java
-│   │   │   │   ├── PortfolioSummary.java
-│   │   │   │   └── SessionStatus.java
-│   │   │   ├── service/
-│   │   │   │   ├── ExecutionService.java
-│   │   │   │   ├── FinnhubMarketDataService.java
-│   │   │   │   ├── MarketDataService.java
-│   │   │   │   ├── NoOpMarketDataService.java
-│   │   │   │   ├── OrderService.java
-│   │   │   │   ├── PositionService.java
-│   │   │   │   └── RedisPublisherService.java
-│   │   │   └── websocket/
-│   │   │       └── PortfolioWebSocketHandler.java
+│   │   │   │   └── Position.java
+│   │   │   └── service/
+│   │   │       ├── ExecutionService.java
+│   │   │       ├── FinnhubMarketDataService.java
+│   │   │       ├── OrderService.java
+│   │   │       ├── PositionService.java
+│   │   │       └── RedisPublisherService.java
 │   │   └── resources/
 │   │       ├── application.yml
 │   │       └── quickfix-client.cfg
 ```
 
-## Monitoring with Redis Commander
+## Monitoring
 
-Access the Redis Commander UI at http://localhost:8085 to view:
+### Redis Commander
+Access http://localhost:8085 to view:
 - Cached orders and positions
-- Market data quotes (`marketdata:quote:*`)
-- Subscribed symbols (`marketdata:subscriptions`)
+- Market data quotes
 - Pub/sub activity
-- Key expiration
+
+### Subscribe to Redis Channels
+```bash
+redis-cli SUBSCRIBE positions:updates executions:updates orders:updates marketdata:updates
+```
 
 ## Troubleshooting
 
+### "FIX session not connected"
+- Ensure Exchange Simulator is running on port 9876
+- Check SenderCompID/TargetCompID match
+
 ### "Finnhub API key not configured"
-Make sure you've set the `FINNHUB_API_KEY` environment variable or configured it in `application.yml`.
+- Set `FINNHUB_API_KEY` environment variable
+- Or configure in `application.yml`
 
 ### "Rate limit reached"
-The free tier allows 60 REST API calls per minute. If you're hitting rate limits:
-- Enable WebSocket mode (default): `FINNHUB_USE_WEBSOCKET=true`
-- Increase refresh interval: `FINNHUB_REFRESH_INTERVAL=10000`
-- Reduce number of subscribed symbols
+- Enable WebSocket mode (default)
+- Increase refresh interval
+- Reduce subscribed symbols
 
-### WebSocket not connecting
-Check that your API key is valid and not expired. The WebSocket URL requires a valid token.
-
-## License
-
-MIT
+### Positions not updating
+- Check Redis is running: `redis-cli ping`
+- Verify executions are being received
+- Check FIX Client logs
