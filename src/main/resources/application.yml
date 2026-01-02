@@ -113,3 +113,10 @@ logging:
     quickfix: WARN
     com.example: INFO
     org.hibernate.SQL: WARN
+
+# Symbol Search Configuration
+symbol-search:
+  # How long to cache symbol info and search results (seconds)
+  cache-ttl-seconds: ${SYMBOL_CACHE_TTL:300}
+  # Maximum number of search results to return
+  max-results: ${SYMBOL_MAX_RESULTS:10}
