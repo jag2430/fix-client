@@ -2,6 +2,8 @@
 
 A Spring Boot middleware application that provides a REST API interface to send FIX orders to an exchange using QuickFIX/J, with Redis caching, real-time position tracking, P&L calculations, and market data integration.
 
+> **This is part of a 4-repository FIX Trading System.** See [fix-trading-ui](https://github.com/jag2430/fix-trading-ui) for the main entry point and system overview.
+
 ## Overview
 
 The FIX Client serves as the middleware layer between user-facing applications (Trading UI, Portfolio Blotter) and the FIX exchange. It handles protocol translation, order management, position tracking, and real-time data distribution.
@@ -20,6 +22,13 @@ The FIX Client serves as the middleware layer between user-facing applications (
 - Order state tracking with status updates
 - Execution report processing and storage
 - Support for MARKET and LIMIT order types
+- **PostgreSQL Persistence**: Orders and executions stored in database via JPA
+
+### Symbol Search & Validation (Finnhub)
+- **Symbol Search**: `/api/symbols/search?q=AAPL` - Real-time autocomplete
+- **Symbol Validation**: `/api/symbols/{symbol}/validate` - Company profile, current price, validation status
+- **Batch Validation**: `POST /api/symbols/validate-batch` - Validate multiple symbols at once
+- **Company Name Lookup**: `/api/symbols/{symbol}/company` - Lightweight endpoint for UI
 
 ### Position Tracking & P&L
 - Real-time position updates from executions
@@ -31,69 +40,76 @@ The FIX Client serves as the middleware layer between user-facing applications (
 ### Market Data Integration (Finnhub)
 - **REST API polling** for quote data (price, open, high, low, change)
 - **WebSocket streaming** for real-time trade prices
-- **Auto-subscription** when positions are opened
-- Redis caching with configurable TTL
+- **Auto-subscription** when positions are opened (`autoSubscribeToMarketData()`)
+- **Redis caching** with configurable TTL
 - Position P&L updates as prices change
 
 ### Redis Integration
-- **Caching**: Orders, positions, executions, market data
+- **Caching**: Orders, positions, executions, market data with TTL
 - **Pub/Sub**: Real-time updates to connected clients
+- **Execution Indexing**: Fast lookup by clOrdId via `EXECUTION_BY_ORDER_KEY_PREFIX`
 - Configurable TTL for different data types
 
-### WebSocket Portfolio Blotter
-- Real-time position and P&L updates
+### WebSocket Support
+- **Portfolio WebSocket**: `/ws/portfolio` for real-time position and P&L updates
 - Execution notifications
 - Market data streaming
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                           FIX Client Application                             │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌────────────────────────────────────────────────────────────────────────┐  │
-│  │                         REST Controllers                               │  │
-│  │  ┌─────────────────┐  ┌──────────────────┐  ┌────────────────────────┐ │  │
-│  │  │ OrderController │   PortfolioController  │  SessionController     │ │  │
-│  │  │ POST/PUT/DELETE │  │ GET positions    │  │  GET session status    │ │  │
-│  │  │ /api/orders     │  │ /api/portfolio   │  │  /api/sessions         │ │  │
-│  │  └────────┬────────┘  └────────┬─────────┘  └────────────────────────┘ │  │
-│  └───────────┼────────────────────┼───────────────────────────────────────┘  │
-│              │                    │                                          │
-│              ▼                    ▼                                          │
-│  ┌────────────────────────────────────────────────────────────────────────┐  │
-│  │                            Services                                    │  │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐  ┌────────────┐   │  │
-│  │  │ OrderService │   PositionService  │ExecutionSvc │  │ RedisPubl. │   │  │
-│  │  │              │  │  P&L Calc    │  │             │  │  Pub/Sub   │   │  │
-│  │  └──────┬───────┘  └──────┬───────┘  └──────┬──────┘  └─────┬──────┘   │  │
-│  │         │                 │                 │               │          │  │
-│  │         │                 │                 │               ▼          │  │
-│  │         │                 │                 │         ┌────────────┐   │  │
-│  │         │                 │                 │         │   Redis    │   │  │
-│  │         │                 │                 │          Cache+Pub/Sub   │  │
-│  │         │                 │                 │         └────────────┘   │  │
-│  └─────────┼─────────────────┼─────────────────┼──────────────────────────┘  │
-│            │                 │                 │                             │
-│            ▼                 │                 │                             │
-│  ┌────────────────────────┐  │                 │                             │
-│  │  ClientFixApplication  │◀───────────────────                           
-│  │  (QuickFIX/J)          │  Execution Reports                               │
-│  │                        │                                                  │                                                                         
-│  │  - fromApp(): Handle   │                                                  │
-│  │    incoming messages   │                                                  │
-│  │  - toApp(): Intercept  │                                                  │
-│  │    outgoing messages   │                                                  │
-│  └───────────┬────────────┘                                                  │
-│              │                                                               │
-│              │ FIX 4.4 Protocol                                              │
-│              ▼                                                               │
-│  ┌────────────────────────┐      ┌────────────────────────┐                  │
-│  │   SocketInitiator      │      │  FinnhubMarketDataSvc  │                  │
-│  │   (FIX Connection)     │      │  REST + WebSocket      │                  │
-│  └───────────┬────────────┘      └───────────┬────────────┘                  │
-└──────────────┼───────────────────────────────┼───────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                           FIX Client Application                              │
+├───────────────────────────────────────────────────────────────────────────────┤
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────────────────┐  │
+│  │                         REST Controllers                                │  │
+│  │  ┌─────────────────┐  ┌───────────────────┐  ┌────────────────────────┐ │  │
+│  │  │ OrderController │  │PortfolioController│  │  SymbolController      │ │  │
+│  │  │ POST/PUT/DELETE │  │ GET positions     │  │  GET /symbols/search   │ │  │
+│  │  │ /api/orders     │  │ /api/portfolio    │  │  GET /symbols/validate │ │  │
+│  │  └────────┬────────┘  └────────┬──────────┘  └────────────────────────┘ │  │
+│  └───────────┼────────────────────┼────────────────────────────────────────┘  │
+│              │                    │                                           │
+│              ▼                    ▼                                           │
+│  ┌────────────────────────────────────────────────────────────────────────┐   │
+│  │                            Services                                    │   │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐  ┌────────────┐   │   │
+│  │  │ OrderService │  │PositionSvc   │  │SymbolSearch │  │ RedisPubl. │   │   │
+│  │  │              │  │  P&L Calc    │  │   Service   │  │  Pub/Sub   │   │   │
+│  │  └──────┬───────┘  └──────┬───────┘  └──────┬──────┘  └─────┬──────┘   │   │
+│  │         │                 │                 │               │          │   │
+│  │         │                 │                 │               ▼          │   │
+│  │         │                 │                 │         ┌────────────┐   │   │
+│  │         │                 │                 │         │   Redis    │   │   │
+│  │         │                 │                 │         │Cache+Pub/Sub   │   │
+│  │         │                 │                 │         └────────────┘   │   │
+│  │         │                 │                 │               │          │   │
+│  │         │                 │                 │               ▼          │   │
+│  │         │                 │                 │         ┌────────────┐   │   │
+│  │         │                 │                 │         │ PostgreSQL │   │   │
+│  │         │                 │                 │         │   (JPA)    │   │   │
+│  │         │                 │                 │         └────────────┘   │   │
+│  └─────────┼─────────────────┼─────────────────┼──────────────────────────┘   │
+│            │                 │                 │                              │
+│            ▼                 │                 │                              │
+│  ┌────────────────────────┐  │                 │                              │
+│  │  ClientFixApplication  │<─┘                 │                              │
+│  │  (QuickFIX/J)          │  Execution Reports │                              │
+│  │                        │                    │                              │
+│  │  - fromApp(): Handle   │                    │                              │
+│  │    incoming messages   │                    │                              │
+│  │  - toApp(): Intercept  │                    │                              │
+│  │    outgoing messages   │                    │                              │
+│  └───────────┬────────────┘                    │                              │
+│              │                                 │                              │
+│              │ FIX 4.4 Protocol                │                              │
+│              ▼                                 ▼                              │
+│  ┌────────────────────────┐      ┌────────────────────────┐                   │
+│  │   SocketInitiator      │      │  FinnhubMarketDataSvc  │                   │
+│  │   (FIX Connection)     │      │  REST + WebSocket      │                   │
+│  └───────────┬────────────┘      └───────────┬────────────┘                   │
+└──────────────┼───────────────────────────────┼────────────────────────────────┘
                │                               │
                ▼                               ▼
       ┌─────────────────┐            ┌─────────────────┐
@@ -165,8 +181,10 @@ SocketConnectPort=9876
 | `orders:all` | Set of ClOrdIds | None | Track all orders |
 | `orders:open` | Set of ClOrdIds | None | Track open orders |
 | `executions:list` | List of executions | 24 hours | Execution history |
+| `executions:order:{clOrdId}` | List of execIds | 24 hours | Index by order |
 | `positions:symbols` | Set of symbols | None | Active positions |
 | `marketdata:subscriptions` | Set of symbols | None | Market data subscriptions |
+| `symbol:info:{symbol}` | Symbol info JSON | 1 hour | Symbol search cache |
 
 ### Pub/Sub Channels
 
@@ -227,6 +245,7 @@ newQuantity = currentQuantity - fillQuantity;
 - **WebSocket**: Real-time trade stream for instant price updates
 - **Auto-Subscribe**: When a position is opened, automatically subscribes to market data
 - **Price Cache**: Redis caching to reduce API calls
+- **Rate Limiting**: Handles 429 responses and 60 calls/min limit
 
 ### Configuration
 
@@ -250,25 +269,28 @@ market-data:
 - Java 17+
 - Maven 3.6+
 - Redis 6+ (or use Docker)
+- PostgreSQL 14+ (or use Docker)
 - Running FIX Exchange Simulator (on port 9876)
 - **Finnhub API Key** (free): https://finnhub.io/register
 
 ## Quick Start
 
-### 1. Get Your Free Finnhub API Key
+### 1. Sign Up For Free Finnhub API Key
 
 1. Go to https://finnhub.io/register
 2. Sign up with email (no credit card required)
 3. Copy your API key from the dashboard
 
-### 2. Start Redis
+### 2. Start Infrastructure (Redis + PostgreSQL)
 
 ```bash
 # Using Docker Compose (recommended)
 docker-compose up -d
 
-# Or start Redis directly
-docker run -d --name redis -p 6379:6379 redis:7-alpine
+# This starts:
+# - Redis on port 6379
+# - PostgreSQL on port 5432
+# - Redis Commander on port 8085
 ```
 
 ### 3. Build the Application
@@ -290,6 +312,7 @@ MARKET_DATA_PROVIDER=none mvn spring-boot:run
 The client will:
 - Connect to the exchange on localhost:9876
 - Connect to Redis on localhost:6379
+- Connect to PostgreSQL on localhost:5432
 - Start a REST API on port 8081
 - Connect to Finnhub for market data
 
@@ -340,6 +363,41 @@ curl "http://localhost:8081/api/orders?openOnly=true"
 
 # Get Specific Order
 curl http://localhost:8081/api/orders/{clOrdId}
+```
+
+### Symbol Search & Validation
+
+```bash
+# Search symbols (autocomplete)
+curl "http://localhost:8081/api/symbols/search?q=AAPL"
+
+# Response:
+[
+  {"symbol": "AAPL", "description": "Apple Inc", "type": "Common Stock"},
+  {"symbol": "AAPL.SW", "description": "Apple Inc", "type": "Common Stock"}
+]
+
+# Validate symbol (get full details)
+curl http://localhost:8081/api/symbols/AAPL/validate
+
+# Response:
+{
+  "valid": true,
+  "symbol": "AAPL",
+  "companyName": "Apple Inc",
+  "currentPrice": 178.50,
+  "change": 2.35,
+  "changePercent": 1.33,
+  "marketCap": 2800000000000
+}
+
+# Batch validate symbols
+curl -X POST http://localhost:8081/api/symbols/validate-batch \
+  -H "Content-Type: application/json" \
+  -d '{"symbols": ["AAPL", "MSFT", "INVALID"]}'
+
+# Get company name only
+curl http://localhost:8081/api/symbols/AAPL/company
 ```
 
 ### Executions
@@ -454,6 +512,11 @@ ws.onmessage = (event) => {
 | `REDIS_PORT` | Redis server port | 6379 |
 | `REDIS_PASSWORD` | Redis password | (empty) |
 | `MARKET_DATA_PROVIDER` | Provider (finnhub/none) | finnhub |
+| `POSTGRES_HOST` | PostgreSQL host | localhost |
+| `POSTGRES_PORT` | PostgreSQL port | 5432 |
+| `POSTGRES_DB` | Database name | fixclient |
+| `POSTGRES_USER` | Database user | fixclient |
+| `POSTGRES_PASSWORD` | Database password | fixclient |
 
 ## Project Structure
 
@@ -471,7 +534,8 @@ fix-client/
 │   │   │   │   └── WebSocketConfig.java
 │   │   │   ├── controller/
 │   │   │   │   ├── OrderController.java
-│   │   │   │   └── PortfolioController.java
+│   │   │   │   ├── PortfolioController.java
+│   │   │   │   └── SymbolController.java
 │   │   │   ├── fix/
 │   │   │   │   └── ClientFixApplication.java
 │   │   │   ├── model/
@@ -479,12 +543,18 @@ fix-client/
 │   │   │   │   ├── OrderRequest.java
 │   │   │   │   ├── OrderResponse.java
 │   │   │   │   └── Position.java
-│   │   │   └── service/
-│   │   │       ├── ExecutionService.java
-│   │   │       ├── FinnhubMarketDataService.java
-│   │   │       ├── OrderService.java
-│   │   │       ├── PositionService.java
-│   │   │       └── RedisPublisherService.java
+│   │   │   ├── repository/
+│   │   │   │   ├── OrderRepository.java
+│   │   │   │   └── ExecutionRepository.java
+│   │   │   ├── service/
+│   │   │   │   ├── ExecutionService.java
+│   │   │   │   ├── FinnhubMarketDataService.java
+│   │   │   │   ├── OrderService.java
+│   │   │   │   ├── PositionService.java
+│   │   │   │   ├── SymbolSearchService.java
+│   │   │   │   └── RedisPublisherService.java
+│   │   │   └── websocket/
+│   │   │       └── PortfolioWebSocketHandler.java
 │   │   └── resources/
 │   │       ├── application.yml
 │   │       └── quickfix-client.cfg
@@ -496,6 +566,7 @@ fix-client/
 Access http://localhost:8085 to view:
 - Cached orders and positions
 - Market data quotes
+- Symbol search cache
 - Pub/sub activity
 
 ### Subscribe to Redis Channels
@@ -513,12 +584,21 @@ redis-cli SUBSCRIBE positions:updates executions:updates orders:updates marketda
 - Set `FINNHUB_API_KEY` environment variable
 - Or configure in `application.yml`
 
-### "Rate limit reached"
+### "Rate limit reached" (429 errors)
 - Enable WebSocket mode (default)
 - Increase refresh interval
 - Reduce subscribed symbols
+- The service handles 429 responses gracefully
 
 ### Positions not updating
 - Check Redis is running: `redis-cli ping`
 - Verify executions are being received
 - Check FIX Client logs
+
+## Related Repositories
+
+| Repository                                                                  | Description |
+|-----------------------------------------------------------------------------|-------------|
+| [fix-trading-ui](https://github.com/jag2430/fix-trading-ui)                 | Order entry UI (main entry point) |
+| [fix-exchange-simulator](https://github.com/jag2430/fix-exchange-simulator) | Matching engine |
+| [portfolio-blotter](https://github.com/jag2430/portfolio-blotter)           | P&L monitoring dashboard |
