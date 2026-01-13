@@ -8,7 +8,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.listener.ChannelTopic;
 import org.springframework.stereotype.Service;
 
@@ -17,12 +17,15 @@ import java.util.Map;
 /**
  * Service for publishing messages to Redis pub/sub channels.
  * Portfolio blotter clients can subscribe to these channels for real-time updates.
+ * 
+ * Note: Uses StringRedisTemplate for pub/sub to avoid double JSON serialization.
+ * We serialize to JSON manually, then StringRedisTemplate sends the string as-is.
  */
 @Slf4j
 @Service
 public class RedisPublisherService {
 
-  private final RedisTemplate<String, Object> redisTemplate;
+  private final StringRedisTemplate stringRedisTemplate;
   private final ChannelTopic positionsTopic;
   private final ChannelTopic executionsTopic;
   private final ChannelTopic ordersTopic;
@@ -31,12 +34,12 @@ public class RedisPublisherService {
   @Value("${redis.channels.marketdata:marketdata:updates}")
   private String marketDataChannel;
 
-  public RedisPublisherService(RedisTemplate<String, Object> redisTemplate,
+  public RedisPublisherService(StringRedisTemplate stringRedisTemplate,
                                ChannelTopic positionsTopic,
                                ChannelTopic executionsTopic,
                                ChannelTopic ordersTopic,
                                ObjectMapper redisObjectMapper) {
-    this.redisTemplate = redisTemplate;
+    this.stringRedisTemplate = stringRedisTemplate;
     this.positionsTopic = positionsTopic;
     this.executionsTopic = executionsTopic;
     this.ordersTopic = ordersTopic;
@@ -52,7 +55,7 @@ public class RedisPublisherService {
           "type", "POSITION_UPDATE",
           "data", position
       ));
-      redisTemplate.convertAndSend(positionsTopic.getTopic(), message);
+      stringRedisTemplate.convertAndSend(positionsTopic.getTopic(), message);
       log.debug("Published position update for {}: qty={}", position.getSymbol(), position.getQuantity());
     } catch (JsonProcessingException e) {
       log.error("Failed to serialize position update", e);
@@ -68,7 +71,7 @@ public class RedisPublisherService {
           "type", "EXECUTION",
           "data", execution
       ));
-      redisTemplate.convertAndSend(executionsTopic.getTopic(), message);
+      stringRedisTemplate.convertAndSend(executionsTopic.getTopic(), message);
       log.debug("Published execution: {} {} {} @ {}",
           execution.getExecType(), execution.getSide(),
           execution.getSymbol(), execution.getLastPrice());
@@ -86,7 +89,7 @@ public class RedisPublisherService {
           "type", updateType,  // ORDER_NEW, ORDER_FILLED, ORDER_CANCELLED, etc.
           "data", order
       ));
-      redisTemplate.convertAndSend(ordersTopic.getTopic(), message);
+      stringRedisTemplate.convertAndSend(ordersTopic.getTopic(), message);
       log.debug("Published order update: {} {}", updateType, order.getClOrdId());
     } catch (JsonProcessingException e) {
       log.error("Failed to serialize order update", e);
@@ -103,7 +106,7 @@ public class RedisPublisherService {
           "updateType", update.getUpdateType(),
           "data", update
       ));
-      redisTemplate.convertAndSend(marketDataChannel, message);
+      stringRedisTemplate.convertAndSend(marketDataChannel, message);
       log.debug("Published market data: {} @ {}", update.getSymbol(), update.getPrice());
     } catch (JsonProcessingException e) {
       log.error("Failed to serialize market data update", e);
@@ -114,6 +117,6 @@ public class RedisPublisherService {
    * Publish a raw message to a specific channel
    */
   public void publishRaw(String channel, String message) {
-    redisTemplate.convertAndSend(channel, message);
+    stringRedisTemplate.convertAndSend(channel, message);
   }
 }
